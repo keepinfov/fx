@@ -2,6 +2,9 @@ const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_usage = @import("session_usage.zig");
+const generation_usage = @import("generation_usage_provider.zig");
+const stream_provider = @import("../agent/stream_provider.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -83,6 +86,116 @@ pub fn writeEncoded(
         sidecar_file,
         encoded,
     );
+}
+
+fn loadCaptured(alloc: Allocator, captured: Captured, session_id: []const u8) !?session_usage.Snapshot {
+    const bytes = switch (captured) {
+        .missing => return null,
+        .invalid => return error.InvalidUsageSidecar,
+        .encoded => |value| value,
+    };
+    var decoded = try decode(alloc, bytes);
+    var decoded_owned = true;
+    defer if (decoded_owned) decoded.deinit(alloc);
+    if (!std.mem.eql(u8, decoded.session_id, session_id)) {
+        return error.UsageSidecarSessionMismatch;
+    }
+    const snapshot = decoded.snapshot;
+    alloc.free(decoded.session_id);
+    decoded_owned = false;
+    return snapshot;
+}
+
+/// Classifies accounting-only recovery without changing normal resume behavior.
+/// Unsafe storage and recognized foreign formats do not authorize a lossy copy.
+pub fn has_recoverable_corruption(alloc: Allocator, session_dir: *io_mod.VerifiedDir, session_id: []const u8) !bool {
+    var captured = try capture(alloc, session_dir);
+    defer captured.deinit(alloc);
+    switch (captured) {
+        .missing => return false,
+        .invalid => |reason| {
+            if (std.mem.eql(u8, reason, "empty") or std.mem.eql(u8, reason, "oversized")) return true;
+            return error.InvalidUsageSidecar;
+        },
+        .encoded => {},
+    }
+    var snapshot = loadCaptured(alloc, captured, session_id) catch |err| {
+        if (err == error.OutOfMemory or err == error.UsageSidecarSessionMismatch) return err;
+        var envelope = std.json.parseFromSlice(std.json.Value, alloc, captured.encoded, .{}) catch |parse_err| {
+            if (parse_err == error.OutOfMemory) return parse_err;
+            return true;
+        };
+        defer envelope.deinit();
+        if (envelope.value == .object) {
+            if (envelope.value.object.get("session_id")) |id| {
+                if (id == .string and id.string.len != 0 and !std.mem.eql(u8, id.string, session_id)) return error.UsageSidecarSessionMismatch;
+            }
+            if (envelope.value.object.get("schema_version")) |version| {
+                if (version == .integer and version.integer != 1) return error.UnsupportedUsageSidecar;
+            }
+            if (envelope.value.object.get("snapshot")) |value| {
+                if (value == .object) {
+                    if (value.object.get("schema_version")) |version| {
+                        if (version == .integer and (version.integer < 0 or !session_usage.supports_snapshot_schema(@intCast(version.integer)))) return error.UnsupportedUsageSidecar;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+    defer if (snapshot) |*value| value.deinit(alloc);
+    return false;
+}
+
+/// A conversation remains usable when its accounting snapshot is damaged.
+/// File access and private-path failures still prevent admission.
+pub fn loadConversation(
+    alloc: Allocator,
+    session_dir: *io_mod.VerifiedDir,
+    session_id: []const u8,
+    continuity_at_ms: i64,
+) !session_usage.Snapshot {
+    var captured = try capture(alloc, session_dir);
+    defer captured.deinit(alloc);
+    if (captured == .invalid) {
+        const reason = captured.invalid;
+        if (!std.mem.eql(u8, reason, "empty") and !std.mem.eql(u8, reason, "oversized")) {
+            return error.InvalidUsageSidecar;
+        }
+    }
+    const loaded = loadCaptured(alloc, captured, session_id) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        traceInvalid(err);
+        break :blk null;
+    };
+    if (loaded) |snapshot| return snapshot;
+    debug_trace.logf("session", "conversation accounting unavailable session={s} completeness=incomplete", .{session_id});
+    var snapshot = session_usage.Snapshot{
+        .billing = .incomplete,
+        .api_duration_complete = false,
+        .wall_duration_complete = false,
+        .code_complete = false,
+        .next_sequence = 1,
+        .settled_through_sequence = 0,
+        .api_duration_ms = 0,
+        .wall_duration_ms = 0,
+        .total_cost = 0,
+        .input_tokens = 0,
+        .output_tokens = 0,
+        .cache_read_tokens = 0,
+        .cache_write_tokens = 0,
+        .billable_web_search_calls = 0,
+        .lines_added = 0,
+        .lines_removed = 0,
+        .models = &.{},
+        .pending = &.{},
+    };
+    errdefer snapshot.deinit(alloc);
+    try session_usage.appendIncidentOwned(alloc, &snapshot, .{
+        .occurred_at_ms = @max(continuity_at_ms, 0),
+        .completeness = .incomplete,
+    });
+    return snapshot;
 }
 
 pub fn capture(
@@ -322,6 +435,62 @@ fn openTestVerifiedDir(dir: std.Io.Dir) !io_mod.VerifiedDir {
     };
 }
 
+test "recovery copy classifies accounting without changing normal resume" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try openTestVerifiedDir(tmp.dir);
+    defer dir.close();
+    try std.testing.expect(!try has_recoverable_corruption(alloc, &dir, "session"));
+    var usage = session_usage.Usage.initFresh();
+    defer usage.deinit(alloc);
+    var snapshot = try usage.snapshot(alloc);
+    defer snapshot.deinit(alloc);
+    try write(alloc, &dir, "session", snapshot);
+    try std.testing.expect(!try has_recoverable_corruption(alloc, &dir, "session"));
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, "{broken");
+    try std.testing.expect(try has_recoverable_corruption(alloc, &dir, "session"));
+    var resumed = try loadConversation(alloc, &dir, "session", 10);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(session_usage.Availability.incomplete, resumed.billing);
+    var retained = try capture(alloc, &dir);
+    defer retained.deinit(alloc);
+    try std.testing.expectEqualStrings("{broken", retained.encoded);
+    try write(alloc, &dir, "foreign", snapshot);
+    try std.testing.expectError(error.UsageSidecarSessionMismatch, has_recoverable_corruption(alloc, &dir, "session"));
+    const valid_bytes = try encode(alloc, "session", snapshot);
+    defer alloc.free(valid_bytes);
+    var future = try std.json.parseFromSlice(std.json.Value, alloc, valid_bytes, .{});
+    defer future.deinit();
+    future.value.object.getPtr("snapshot").?.object.getPtr("schema_version").?.* = .{ .integer = 4 };
+    var future_bytes: std.Io.Writer.Allocating = .init(alloc);
+    defer future_bytes.deinit();
+    try std.json.Stringify.value(future.value, .{}, &future_bytes.writer);
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, future_bytes.written());
+    try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
+    try io_mod.durableReplaceVerified(alloc, &dir, sidecar_file, "{\"schema_version\":2,\"session_id\":\"session\",\"snapshot\":{}}");
+    try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
+    const file = try dir.dir.openFile(std.testing.io, sidecar_file, .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    try file.setPermissions(std.testing.io, .fromMode(0o644));
+    try std.testing.expectError(error.InvalidUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
+}
+
+test "conversation accounting recovery refuses unsafe storage" {
+    const alloc = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var verified = try openTestVerifiedDir(temp.dir);
+    defer verified.close();
+    try temp.dir.createDir(std.testing.io, sidecar_file, .fromMode(0o700));
+    try std.testing.expectError(error.InvalidUsageSidecar, loadConversation(alloc, &verified, "session", 10));
+    try temp.dir.deleteDir(std.testing.io, sidecar_file);
+    var file = try temp.dir.createFile(std.testing.io, sidecar_file, .{ .permissions = .fromMode(0o644) });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "{corrupt but not private");
+    try std.testing.expectError(error.InvalidUsageSidecar, loadConversation(alloc, &verified, "session", 10));
+}
+
 test "usage sidecar restores rich fields only for its bound session and projection" {
     const alloc = std.testing.allocator;
     var temp = std.testing.tmpDir(.{});
@@ -550,6 +719,125 @@ test "missing and corrupt usage sidecars retain canonical usage with one fixed g
     );
     try std.testing.expectEqual(@as(usize, 1), corrupt.incidents.len);
     try std.testing.expectEqual(@as(i64, 31), corrupt.incidents[0].occurred_at_ms);
+}
+
+test "torn exact settlement republishes stale backlog without reapplying totals" {
+    const Checkpoint = struct {
+        fn persist(_: *anyopaque, _: session_usage.Snapshot) !void {}
+    };
+    const RejectPublication = struct {
+        fn publish(_: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            if (event == .generation) return error.InjectedPublicationFailure;
+        }
+    };
+    const PublicationProbe = struct {
+        generations: usize = 0,
+
+        fn publish(raw: *anyopaque, event: session_usage.usage_report.ProfileEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (event == .generation) self.generations += 1;
+        }
+    };
+    const LookupProbe = struct {
+        calls: usize = 0,
+
+        fn lookup(
+            raw: ?*anyopaque,
+            _: Allocator,
+            _: generation_usage.LookupInput,
+        ) generation_usage.LookupError!generation_usage.LookupOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return error.Unavailable;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const completion: types.ModelCompletion = .{
+        .generation_id = "response-torn-1",
+        .billing = .{
+            .created_at_ms = 100,
+            .model = "codex/gpt-test",
+            .total_cost = 0,
+            .input_tokens = 17,
+            .output_tokens = 7,
+            .cache_read_tokens = 2,
+            .cache_write_tokens = 0,
+            .reasoning_tokens = 1,
+            .billable_web_search_calls = 0,
+        },
+    };
+    const exact = stream_provider.UsageOutcome{ .exact = .codex };
+
+    var checkpoint_context: u8 = 0;
+    var publication_context: u8 = 0;
+    var bridge_source = session_usage.Usage.initFresh();
+    defer bridge_source.deinit(alloc);
+    bridge_source.configureCheckpointSink(.{
+        .context = &checkpoint_context,
+        .allocator = alloc,
+        .persist = Checkpoint.persist,
+    });
+    bridge_source.configurePublicationSink(.{
+        .context = &publication_context,
+        .allocator = alloc,
+        .publish = RejectPublication.publish,
+    });
+    const bridge_observation = try session_usage.InvocationObservation.begin(&bridge_source);
+    try bridge_observation.complete(alloc, completion, exact);
+    var stale_rich = try bridge_source.snapshot(alloc);
+    defer stale_rich.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), stale_rich.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), stale_rich.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 0), stale_rich.input_tokens);
+
+    var settled_source = session_usage.Usage.initFresh();
+    defer settled_source.deinit(alloc);
+    const settled_observation = try session_usage.InvocationObservation.begin(&settled_source);
+    try settled_observation.complete(alloc, completion, exact);
+    var durable = try settled_source.snapshot(alloc);
+    defer durable.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), durable.pending.len);
+    try std.testing.expectEqual(@as(u64, 17), durable.input_tokens);
+
+    const stale_bytes = try encode(alloc, "session-torn", stale_rich);
+    defer alloc.free(stale_bytes);
+    try std.testing.expectEqual(
+        RestoreOutcome.mismatched,
+        try restoreCaptured(
+            alloc,
+            .{ .encoded = stale_bytes },
+            "session-torn",
+            200,
+            &durable,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), durable.pending.len);
+    try std.testing.expectEqual(@as(usize, 1), durable.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 17), durable.input_tokens);
+
+    var lookup = LookupProbe{};
+    var publication = PublicationProbe{};
+    var resumed = session_usage.Usage.initFreshWithProviders(.{
+        .codex = .{ .context = &lookup, .lookup_fn = LookupProbe.lookup },
+    });
+    defer resumed.deinit(alloc);
+    resumed.configurePublicationSink(.{
+        .context = &publication,
+        .allocator = alloc,
+        .publish = PublicationProbe.publish,
+    });
+    try resumed.restore(alloc, durable, 1);
+
+    var final = try resumed.snapshot(alloc);
+    defer final.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), publication.generations);
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    try std.testing.expectEqual(@as(usize, 0), final.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), final.publication_backlog.len);
+    try std.testing.expectEqual(@as(u64, 17), final.input_tokens);
+    try std.testing.expectEqual(@as(u64, 7), final.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), final.request_count);
 }
 
 fn legacyCopyForTest(

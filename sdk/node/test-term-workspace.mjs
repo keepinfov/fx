@@ -23,6 +23,7 @@ const execCalls = [];
 let abortStarted = false;
 let abortObserved = false;
 let checkedToolProjection = false;
+let checkedBrowserCapabilityContext = false;
 const truncatedOutput = `start\n${"🙂".repeat(17_000)}\nend\n`;
 const truncatedBytes = encoder.encode(truncatedOutput).length;
 
@@ -72,12 +73,12 @@ function sse(events) {
 
 function toolCall(id, command) {
   return sse([
-    { type: "tool-call", toolCallId: id, toolName: "terminal", input: { action: "exec", command } },
+    { type: "tool-call", toolCallId: id, toolName: "shell", input: { action: "run", command } },
     { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
   ]);
 }
 
-function terminalToolCalls(calls) {
+function shellToolCalls(calls) {
   const events = calls.flatMap(({ id, input }) => {
     const serialized = JSON.stringify(input);
     const deltas = [];
@@ -85,10 +86,10 @@ function terminalToolCalls(calls) {
       deltas.push({ type: "tool-input-delta", id, delta: serialized.slice(offset, offset + 4096) });
     }
     return [
-      { type: "tool-input-start", id, toolName: "terminal" },
+      { type: "tool-input-start", id, toolName: "shell" },
       ...deltas,
       { type: "tool-input-end", id },
-      { type: "tool-call", toolCallId: id, toolName: "terminal" },
+      { type: "tool-call", toolCallId: id, toolName: "shell" },
     ];
   });
   const responseEvents = [
@@ -150,17 +151,31 @@ const fetch = async (_url, init = {}) => {
     return new Response(JSON.stringify(catalog), { status: 200, headers: { "content-type": "application/json" } });
   }
   const body = JSON.parse(requestDecoder.decode(init.body));
+  if (!checkedBrowserCapabilityContext) {
+    const serializedPrompt = JSON.stringify(body.prompt || []);
+    for (const guidance of [
+      "embedded browser version of fx",
+      "Public web fetch, web search, and general outbound network access are unavailable",
+      "Do not attempt curl, wget",
+      "locally installed fx provides the full tool suite",
+    ]) {
+      if (!serializedPrompt.includes(guidance)) {
+        throw new Error(`browser capability context omitted ${guidance}: ${serializedPrompt}`);
+      }
+    }
+    checkedBrowserCapabilityContext = true;
+  }
   if (!checkedToolProjection) {
-    if (body.tools?.length !== 1 || body.tools[0]?.name !== "terminal") {
+    if (body.tools?.length !== 1 || body.tools[0]?.name !== "shell") {
       throw new Error(`workspace advertised unexpected tools: ${JSON.stringify(body.tools)}`);
     }
     const schema = body.tools[0]?.inputSchema;
     if (JSON.stringify(schema?.required) !== JSON.stringify(["action", "command"]) ||
-        schema?.properties?.action?.enum?.[0] !== "exec" ||
+        schema?.properties?.action?.enum?.[0] !== "run" ||
         schema?.properties?.command?.maxLength !== 65_536 ||
         Object.keys(schema?.properties || {}).join(",") !== "action,command" ||
         schema?.additionalProperties !== false) {
-      throw new Error(`workspace advertised unexpected terminal schema: ${JSON.stringify(schema)}`);
+      throw new Error(`workspace advertised unexpected shell schema: ${JSON.stringify(schema)}`);
     }
     checkedToolProjection = true;
   }
@@ -185,9 +200,9 @@ const fetch = async (_url, init = {}) => {
   }
   if (toolResult(body, "workspace-oversized")) {
     requireResult(body, "workspace-oversized", ["exceeds 65536 bytes"]);
-    requireResult(body, "workspace-profile", ["accepts only the", "action", "command", "fields"]);
-    requireResult(body, "workspace-durable", ["action must be", "exec"]);
-    requireResult(body, "workspace-unknown", ["accepts only the", "action", "command", "fields"]);
+    requireResult(body, "workspace-profile", ["accepts only action and command"]);
+    requireResult(body, "workspace-durable", ["action must be run"]);
+    requireResult(body, "workspace-unknown", ["accepts only action and command"]);
     return textResponse("invalid boundaries checked");
   }
   const prompt = latestUserText(body);
@@ -196,12 +211,15 @@ const fetch = async (_url, init = {}) => {
   if (prompt.includes("workspace timeout")) return toolCall("workspace-timeout", "timeout-command");
   if (prompt.includes("workspace abort")) return toolCall("workspace-abort", "hold-command");
   if (prompt.includes("workspace invalid boundaries")) {
-    return terminalToolCalls([
-      { id: "workspace-oversized", input: { action: "exec", command: "x".repeat(65_537) } },
-      { id: "workspace-profile", input: { action: "exec", command: "must-not-run", profile: "clean" } },
-      { id: "workspace-durable", input: { action: "start", command: "must-not-run" } },
-      { id: "workspace-unknown", input: { action: "exec", command: "must-not-run", unexpected: true } },
+    return shellToolCalls([
+      { id: "workspace-oversized", input: { action: "run", command: "x".repeat(65_537) } },
+      { id: "workspace-profile", input: { action: "run", command: "must-not-run", profile: "clean" } },
+      { id: "workspace-durable", input: { action: "wait", session_id: "must-not-run" } },
+      { id: "workspace-unknown", input: { action: "run", command: "must-not-run", unexpected: true } },
     ]);
+  }
+  if (prompt.includes("unsupported web request")) {
+    return textResponse("This embedded browser cannot access the public web. Install fx locally for the full tool suite.");
   }
   if (prompt.includes("workspace recovery")) return textResponse("session stayed alive");
   throw new Error(`unexpected gateway request: ${JSON.stringify(body)}`);
@@ -249,6 +267,7 @@ runtime.write("\x03");
 await waitFor(() => abortObserved, "workspace exec abort signal");
 await waitFor(() => grid().includes("abort mapping checked"), "workspace abort mapping");
 await prompt("workspace invalid boundaries", "invalid boundaries checked");
+await prompt("unsupported web request", "cannot access the public web");
 await prompt("workspace recovery", "session stayed alive");
 
 runtime.write("/exit\r");
@@ -258,7 +277,8 @@ const exitCode = await Promise.race([
 ]);
 if (exitCode !== 0) throw new Error(`fx-term exited with ${exitCode}`);
 if (!checkedToolProjection) throw new Error("workspace tool projection was not checked");
+if (!checkedBrowserCapabilityContext) throw new Error("browser capability context was not checked");
 if (execCalls.join(",") !== "printf adapter-success,generate-truncated-output,timeout-command,hold-command") {
   throw new Error(`unexpected workspace exec calls: ${execCalls.join(",")}`);
 }
-console.log("headless workspace passed: success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");
+console.log("headless workspace passed: capability refusal, success, truncation, timeout, Ctrl-C abort, and strict invalid boundaries mapped through the host adapter");

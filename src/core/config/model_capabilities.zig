@@ -6,6 +6,13 @@ pub const ResolvedProviderOptions = struct {
     fast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
+    /// Borrowed gateway provider slugs in preference order. Empty leaves
+    /// provider selection to the gateway. The backing memory must outlive
+    /// request-body serialization.
+    provider_order: []const []const u8 = &.{},
+    /// Sends `provider_order` as the gateway's hard `only` restriction
+    /// instead of its `order` preference.
+    provider_strict: bool = false,
 };
 
 pub const ReasoningEffortOptions = struct {
@@ -22,6 +29,12 @@ pub const ReasoningEffortOptions = struct {
     pub fn slice(self: *const ReasoningEffortOptions) []const types.ReasoningEffort {
         return self.values[0..self.len];
     }
+};
+
+pub const ImageInputSupport = enum {
+    unknown,
+    non_native,
+    native,
 };
 
 pub const GatewayMetadata = struct {
@@ -42,13 +55,14 @@ pub const Capabilities = struct {
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
+    intrinsic_fast: bool = false,
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
+    image_input_support: ImageInputSupport = .unknown,
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
-    prompt_caching: bool = false,
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
@@ -78,6 +92,10 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
+        capabilities.image_input_support = if (metadata.supports_vision and metadata.supports_file_input)
+            .native
+        else
+            .non_native;
         capabilities.supports_web_search = metadata.supports_web_search;
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
@@ -87,19 +105,53 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
     return capabilities;
 }
 
-pub fn resolveCapabilities(_: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
-    return mergeCapabilities(.{}, gateway_metadata);
+pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata) Capabilities {
+    return mergeCapabilities(capabilitiesForModel(model), gateway_metadata);
 }
 
 pub fn capabilitiesForModel(model: []const u8) Capabilities {
-    return resolveCapabilities(model, null);
+    return .{ .intrinsic_fast = std.mem.endsWith(u8, model, "-fast") };
 }
 
 pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilities {
-    if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
-        return app.resolvedModelCapabilities(model);
+    const generic = capabilitiesForModel(model);
+    var capabilities = if (comptime @hasDecl(App, "resolvedModelCapabilities"))
+        app.resolvedModelCapabilities(model)
+    else
+        generic;
+    capabilities.intrinsic_fast = capabilities.intrinsic_fast or generic.intrinsic_fast;
+    return capabilities;
+}
+
+// A catalog output limit that fills the whole context window cannot bound a real request, and
+// omitting the limit lets some providers stop replies at a few thousand tokens.
+const full_window_output_tokens: u32 = 32_768;
+const full_window_output_divisor: u32 = 8;
+
+/// Output tokens to request and reserve for one model call, or null to leave the limit unset.
+pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
+    const advertised = capabilities.max_output_tokens orelse return null;
+    const window = capabilities.context_window orelse return advertised;
+    if (advertised < window) return advertised;
+    return @min(full_window_output_tokens, window / full_window_output_divisor);
+}
+
+test "request output limit bounds full-window catalog limits" {
+    const cases = [_]struct {
+        capabilities: Capabilities,
+        expected: ?u32,
+    }{
+        .{ .capabilities = .{}, .expected = null },
+        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 1_000_000 }, .expected = 32_768 },
+        .{ .capabilities = .{ .context_window = 131_072, .max_output_tokens = 131_072 }, .expected = 16_384 },
+        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = 16_000 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, requestOutputTokens(case.capabilities));
     }
-    return capabilitiesForModel(model);
 }
 
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
@@ -139,7 +191,6 @@ pub fn resolveProviderOptionsForCapabilities(
 ) ResolvedProviderOptions {
     var resolved: ResolvedProviderOptions = .{
         .parallel_tool_calls = capabilities.parallel_tool_calls,
-        .prompt_caching = capabilities.prompt_caching,
     };
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {
         resolved.reasoning = effort;
@@ -148,18 +199,32 @@ pub fn resolveProviderOptionsForCapabilities(
     return resolved;
 }
 
-test "capabilities never infer reasoning or Fast controls from model IDs" {
-    const models = [_][]const u8{
-        "openai/gpt-5.6-sol",
-        "anthropic/claude-opus-4.8",
-        "zai/glm-5.2",
-        "zai/glm-5.2-fast",
+test "capabilities infer intrinsic fast identity but not controls from model IDs" {
+    const models = [_]struct { id: []const u8, intrinsic_fast: bool }{
+        .{ .id = "openai/gpt-5.6-sol", .intrinsic_fast = false },
+        .{ .id = "anthropic/claude-opus-4.8", .intrinsic_fast = false },
+        .{ .id = "zai/glm-5.2", .intrinsic_fast = false },
+        .{ .id = "zai/glm-5.2-fast", .intrinsic_fast = true },
+        .{ .id = "provider/breakfast", .intrinsic_fast = false },
     };
     for (models) |model| {
-        const capabilities = capabilitiesForModel(model);
+        const capabilities = capabilitiesForModel(model.id);
         try std.testing.expectEqual(@as(usize, 0), capabilities.reasoning_efforts.len);
         try std.testing.expect(!capabilities.supports_fast_mode);
+        try std.testing.expectEqual(model.intrinsic_fast, capabilities.intrinsic_fast);
     }
+}
+
+test "resolveForApp adds intrinsic fast identity to provider capabilities" {
+    const App = struct {
+        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) Capabilities {
+            return .{};
+        }
+    };
+    var app = App{};
+
+    try std.testing.expect(resolveForApp(App, &app, "provider/model-fast").intrinsic_fast);
+    try std.testing.expect(!resolveForApp(App, &app, "provider/model-default").intrinsic_fast);
 }
 
 test "mergeCapabilities preserves provider controls and supplied fallback policy" {
@@ -167,7 +232,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
         types.ReasoningEffort.literal("future-tier"),
         types.ReasoningEffort.literal("high"),
     };
-    const capabilities = mergeCapabilities(.{ .prompt_caching = true }, .{
+    const capabilities = mergeCapabilities(.{ .intrinsic_fast = true }, .{
         .reasoning_efforts = .fromSlice(&efforts),
         .supports_fast_mode = true,
         .supports_tool_use = true,
@@ -181,6 +246,7 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     });
 
     try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expect(capabilities.intrinsic_fast);
     try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
     try std.testing.expectEqualStrings("future-tier", capabilities.reasoning_efforts.values[0].label());
     try std.testing.expect(capabilities.supports_fast_mode);
@@ -190,9 +256,27 @@ test "mergeCapabilities preserves provider controls and supplied fallback policy
     try std.testing.expect(capabilities.supports_web_search);
     try std.testing.expect(capabilities.supports_explicit_caching);
     try std.testing.expect(capabilities.supports_implicit_caching);
-    try std.testing.expect(capabilities.prompt_caching);
     try std.testing.expectEqual(@as(?u32, 300_000), capabilities.context_window);
     try std.testing.expectEqual(@as(?u32, 32_000), capabilities.max_output_tokens);
+}
+
+test "image input support distinguishes unknown native and non native capability" {
+    try std.testing.expectEqual(
+        ImageInputSupport.unknown,
+        capabilitiesForModel("provider/unknown").image_input_support,
+    );
+
+    const native = mergeCapabilities(.{}, .{
+        .supports_vision = true,
+        .supports_file_input = true,
+    });
+    try std.testing.expectEqual(ImageInputSupport.native, native.image_input_support);
+
+    const non_native = mergeCapabilities(.{}, .{
+        .supports_vision = true,
+        .supports_file_input = false,
+    });
+    try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
 }
 
 test "reasoning effort picker helpers prepend default and preserve Gateway order" {
@@ -272,6 +356,5 @@ test "request controls remain safe across repeated state transitions" {
 
 test "generic fallback capabilities contain no vendor policy" {
     const fallback = capabilitiesForModel("anthropic/claude-any");
-    try std.testing.expect(!fallback.prompt_caching);
     try std.testing.expect(fallback.context_window == null);
 }

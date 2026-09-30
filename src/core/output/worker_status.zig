@@ -18,38 +18,24 @@ const RouteRecoveryStatus = struct {
             else
                 0,
         };
-        var base_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        const label = if (status.isRecovered())
-            format_recovered_label(&result.label, status)
-        else if (status.action == .waiting_for_connectivity)
-            std.fmt.bufPrint(
-                &result.label,
-                "{s} · Esc to try later",
-                .{status.label(&base_buf)},
-            ) catch status.label(&result.label)
-        else if (status.action == .paused)
-            switch (status.required_action) {
-                .continue_later => std.fmt.bufPrint(
-                    &result.label,
-                    "{s} · /continue to resume",
-                    .{status.label(&base_buf)},
-                ) catch status.label(&result.label),
-                .inspect_uncertain_tool => std.fmt.bufPrint(
-                    &result.label,
-                    "{s} · inspect tool state before /continue",
-                    .{status.label(&base_buf)},
-                ) catch status.label(&result.label),
-                .change_request => std.fmt.bufPrint(
-                    &result.label,
-                    "{s} · change the request to continue",
-                    .{status.label(&base_buf)},
-                ) catch status.label(&result.label),
-                .none => status.label(&result.label),
-            }
-        else
-            status.label(&result.label);
+        const label = format_status_label(&result.label, status);
         store_label(result.label[0..], &result.label_len, label);
         return result;
+    }
+
+    fn refresh_retry_label(
+        self: *RouteRecoveryStatus,
+        now: std.Io.Clock.Timestamp,
+    ) bool {
+        if (self.status.kind != .auto_retry or self.status.retry_deadline == null) {
+            return false;
+        }
+
+        var next_buffer: [types.RouteRecoveryStatus.label_max_bytes + 64]u8 = undefined;
+        const next_label = format_retry_label(&next_buffer, self.status, now);
+        if (std.mem.eql(u8, self.label[0..self.label_len], next_label)) return false;
+        store_label(self.label[0..], &self.label_len, next_label);
+        return true;
     }
 
     fn projection(self: *const RouteRecoveryStatus) activity_runtime.ActivityProjection {
@@ -159,15 +145,86 @@ pub const State = union(enum) {
             .none, .api => false,
         };
     }
+
+    pub fn refresh_route_recovery(
+        self: *State,
+        now: std.Io.Clock.Timestamp,
+    ) bool {
+        return switch (self.*) {
+            .route_recovery => |*status| status.refresh_retry_label(now),
+            .none, .api => false,
+        };
+    }
 };
+
+fn format_status_label(
+    buf: []u8,
+    status: types.RouteRecoveryStatus,
+) []const u8 {
+    var base_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    return if (status.isRecovered())
+        format_recovered_label(buf, status)
+    else if (status.action == .waiting_for_connectivity)
+        std.fmt.bufPrint(
+            buf,
+            "{s} · esc to pause",
+            .{status.label(&base_buf)},
+        ) catch status.label(buf)
+    else if (status.action == .paused)
+        switch (status.required_action) {
+            .continue_later => std.fmt.bufPrint(
+                buf,
+                "{s} · send a new message when you're ready",
+                .{status.label(&base_buf)},
+            ) catch status.label(buf),
+            .inspect_uncertain_tool => std.fmt.bufPrint(
+                buf,
+                "{s} · reopen the session to continue",
+                .{status.label(&base_buf)},
+            ) catch status.label(buf),
+            .change_request => std.fmt.bufPrint(
+                buf,
+                "{s} · change the request to continue",
+                .{status.label(&base_buf)},
+            ) catch status.label(buf),
+            .surface_stall => std.fmt.bufPrint(
+                buf,
+                "{s} · the response kept failing at the same point",
+                .{status.label(&base_buf)},
+            ) catch status.label(buf),
+            .none => status.label(buf),
+        }
+    else
+        status.label(buf);
+}
+
+fn format_retry_label(
+    buf: []u8,
+    status: types.RouteRecoveryStatus,
+    now: std.Io.Clock.Timestamp,
+) []const u8 {
+    var projected = status;
+    const deadline = status.retry_deadline orelse return format_status_label(buf, status);
+    std.debug.assert(now.clock == .awake);
+    std.debug.assert(deadline.clock == .awake);
+    if (std.Io.Clock.Timestamp.compare(now, .lt, deadline)) {
+        const remaining_ns = now.raw.durationTo(deadline.raw).toNanoseconds();
+        const remaining_seconds = @divTrunc(remaining_ns - 1, std.time.ns_per_s) + 1;
+        projected.delay_seconds = std.math.cast(u64, remaining_seconds) orelse
+            std.math.maxInt(u64);
+    } else {
+        projected.delay_seconds = 0;
+    }
+    return format_status_label(buf, projected);
+}
 
 fn format_recovered_label(buf: []u8, status: types.RouteRecoveryStatus) []const u8 {
     return switch (status.kind) {
-        .auto_recovered => if (status.succeeded_attempt > 0 and status.attempt_limit > 0)
+        .auto_recovered => if (status.succeeded_attempt > 0)
             std.fmt.bufPrint(
                 buf,
-                "✓ recovered · attempt {d}/{d}",
-                .{ status.succeeded_attempt, status.attempt_limit },
+                "✓ recovered · attempt {d}",
+                .{status.succeeded_attempt},
             ) catch "✓ recovered"
         else
             "✓ recovered",
@@ -186,6 +243,13 @@ fn store_label(buffer: []u8, len: *usize, label: []const u8) void {
     len.* = label.len;
 }
 
+fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {
+    return .{
+        .clock = .awake,
+        .raw = .fromNanoseconds(@as(i96, milliseconds) * std.time.ns_per_ms),
+    };
+}
+
 test "worker status projects route recovery and expires recovered state" {
     var state: State = .none;
     state.set_route_recovery(.{
@@ -197,7 +261,7 @@ test "worker status projects route recovery and expires recovered state" {
     switch (state.projection().?) {
         .turn_thinking => |projection| {
             try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.warning, projection.tone);
-            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request · attempt 1/3", projection.label);
+            try std.testing.expectEqualStrings("⚠ Provider unavailable · retrying request", projection.label);
         },
         .none, .tool_slot => return error.TestUnexpectedResult,
     }
@@ -210,6 +274,62 @@ test "worker status projects route recovery and expires recovered state" {
     try std.testing.expect(!state.expire_transient(2_499));
     try std.testing.expect(state.expire_transient(2_500));
     try std.testing.expect(state.projection() == null);
+}
+
+test "worker status refreshes retry countdown from awake deadline" {
+    var state: State = .none;
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 1,
+        .attempt_limit = 3,
+        .delay_seconds = 4,
+        .retry_deadline = test_awake_timestamp(4_000),
+    }, 0);
+
+    try std.testing.expect(!state.refresh_route_recovery(test_awake_timestamp(0)));
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(1_000)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 3s",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(2_001)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 2s",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(3_750)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request in 1s",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(state.refresh_route_recovery(test_awake_timestamp(4_000)));
+    switch (state.projection().?) {
+        .turn_thinking => |projection| try std.testing.expectEqualStrings(
+            "⚠ Provider unavailable · retrying request",
+            projection.label,
+        ),
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!state.refresh_route_recovery(test_awake_timestamp(4_250)));
+
+    state.set_route_recovery(.{
+        .kind = .auto_retry,
+        .failed_attempt = 2,
+        .attempt_limit = 3,
+    }, 0);
+    try std.testing.expect(!state.refresh_route_recovery(test_awake_timestamp(5_000)));
 }
 
 test "worker status API state is sticky until explicitly cleared" {
@@ -239,7 +359,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · waiting for connection · attempt 2/10 · Esc to try later",
+            "⚠ Mac woke from sleep · waiting for connection · esc to pause",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -255,7 +375,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2/10 · /continue to resume",
+            "⚠ Mac woke from sleep · connection still unavailable · recovery paused · attempt 2 · send a new message when you're ready",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
@@ -271,7 +391,7 @@ test "worker status route recovery labels expose required controls" {
     }, 0);
     switch (state.projection().?) {
         .turn_thinking => |projection| try std.testing.expectEqualStrings(
-            "⚠ Response ended early · recovery paused after 10/10 attempts · inspect tool state before /continue",
+            "⚠ Response ended early · recovery paused after 10 attempts · reopen the session to continue",
             projection.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,

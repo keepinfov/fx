@@ -18,14 +18,17 @@ pub const Bundle = struct {
         grok,
     };
     pub const Capabilities = struct {
+        gateway_prompt_caching: bool = false,
         fx_search: bool = false,
         vision_fallback: bool = false,
-        deferred_usage: bool = false,
     };
 
     capabilities: Capabilities = .{},
     presentation: ?*const provider_catalog.Entry = null,
     auth_strategy: ?AuthStrategy = null,
+    /// Fixed low-cost model used for session title generation side calls.
+    /// Null disables generated titles for the provider.
+    title_model: ?[]const u8 = null,
     fallback_model_capabilities_fn: *const fn ([]const u8) model_capabilities.Capabilities = emptyModelCapabilities,
     agent_stream: ?stream_provider.Provider = null,
     cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
@@ -52,12 +55,20 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
+    configured_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .configured => blk: {
+                const factory = self.configured_fn orelse break :blk .{};
+                const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
+                const bound = provider.bind(registry) catch break :blk .{};
+                break :blk factory(registry.get(bound.label()).?);
+            },
         };
     }
 
@@ -110,12 +121,12 @@ test "provider set selects each provider's complete route" {
             _: auto_classifier.ProviderInput,
             _: auto_classifier.ReviewRequest,
         ) anyerror!auto_classifier.ParseOutcome {
-            return .invalid;
+            return .{ .invalid = .provider_failed };
         }
     };
 
     const gateway = Bundle{
-        .capabilities = .{ .fx_search = true, .vision_fallback = true, .deferred_usage = true },
+        .capabilities = .{ .fx_search = true, .vision_fallback = true },
         .presentation = provider_catalog.find(.gateway),
         .auth_strategy = .vercel,
         .agent_stream = stream_provider.Provider{
@@ -150,12 +161,10 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.gateway).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.gateway).capabilities.fx_search);
     try std.testing.expect(providers.select(.gateway).capabilities.vision_fallback);
-    try std.testing.expect(providers.select(.gateway).capabilities.deferred_usage);
     try std.testing.expect(providers.select(.gateway).deferred_usage != null);
     try std.testing.expectEqualStrings("vercel", providers.select(.gateway).presentation.?.slug);
     try std.testing.expectEqual(Bundle.AuthStrategy.vercel, providers.select(.gateway).auth_strategy.?);
     try std.testing.expect(!providers.select(.codex).capabilities.fx_search);
-    try std.testing.expect(!providers.select(.codex).capabilities.deferred_usage);
     try std.testing.expect(providers.select(.codex).deferred_usage == null);
     try std.testing.expect(providers.select(.gateway).cli_model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));

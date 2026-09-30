@@ -141,6 +141,21 @@ pub fn environment(
     };
 }
 
+pub fn environmentForShellSpec(
+    alloc: Allocator,
+    configured_login_shell: ?[]const u8,
+    shell: contracts.ShellSpec,
+) (ResolveError || Allocator.Error)!Environment {
+    const invocation = try resolve(configured_login_shell, shell);
+    return switch (shell) {
+        .user_login => .{ .user = try alloc.dupe(u8, invocation.path) },
+        .executable => |value| if (value.clean_start)
+            .{ .clean = try alloc.dupe(u8, invocation.path) }
+        else
+            .{ .user = try alloc.dupe(u8, invocation.path) },
+    };
+}
+
 pub fn profileShell(
     alloc: Allocator,
     configured_login_shell: ?[]const u8,
@@ -167,7 +182,13 @@ pub fn profileShell(
     };
 }
 
-pub fn capturedInvocation(environment_value: Environment, command: []const u8) ResolveError!Invocation {
+const captured_zsh_user_prelude = "\\builtin trap - TERM; ";
+
+pub fn capturedInvocation(
+    alloc: Allocator,
+    environment_value: Environment,
+    command: []const u8,
+) (ResolveError || Allocator.Error)!Invocation {
     switch (environment_value) {
         .legacy, .workspace_clean => return error.UnsupportedShell,
         .clean => |path| {
@@ -186,7 +207,11 @@ pub fn capturedInvocation(environment_value: Environment, command: []const u8) R
                 invocation.append("-O");
                 invocation.append("expand_aliases");
             }
-            invocation.setCommand(command);
+            const effective_command = if (shellKind(path) == .zsh)
+                try std.mem.concat(alloc, u8, &.{ captured_zsh_user_prelude, command })
+            else
+                command;
+            invocation.setCommand(effective_command);
             return invocation;
         },
     }
@@ -338,6 +363,32 @@ test "resolver makes clean startup explicit" {
     );
 }
 
+test "shell environments bind executable path and startup mode" {
+    const alloc = std.testing.allocator;
+    const clean = try environmentForShellSpec(
+        alloc,
+        null,
+        .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+    );
+    defer switch (clean) {
+        .clean => |path| alloc.free(@constCast(path)),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("/bin/bash", clean.clean);
+
+    const user = try environmentForShellSpec(
+        alloc,
+        null,
+        .{ .executable = .{ .path = "/bin/bash" } },
+    );
+    defer switch (user) {
+        .user => |path| alloc.free(@constCast(path)),
+        else => {},
+    };
+    try std.testing.expectEqualStrings("/bin/bash", user.user);
+    try std.testing.expect(!clean.eql(user));
+}
+
 test "resolver rejects missing relative and unsupported shells" {
     try std.testing.expectError(
         error.MissingLoginShell,
@@ -377,34 +428,44 @@ test "login shell resolution falls back without accepting explicit unsupported s
 }
 
 test "captured profiles use exact non-PTY argv" {
-    const bash_clean = try capturedInvocation(.{ .clean = "/bin/bash" }, "printf clean");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const bash_clean = try capturedInvocation(arena, .{ .clean = "/bin/bash" }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--noprofile", "--norc", "-c", "printf clean" },
         bash_clean.argv(),
     );
-    const bash_user = try capturedInvocation(.{ .user = "/bin/bash" }, "printf user");
+    const bash_user = try capturedInvocation(arena, .{ .user = "/bin/bash" }, "printf user");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/bash", "--login", "-O", "expand_aliases", "-c", "printf user" },
         bash_user.argv(),
     );
-    const zsh_clean = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf clean");
+    const zsh_clean = try capturedInvocation(arena, .{ .clean = "/bin/zsh" }, "printf clean");
     try std.testing.expectEqualSlices(
         []const u8,
         &.{ "/bin/zsh", "-f", "-c", "printf clean" },
         zsh_clean.argv(),
     );
-    const zsh_user = try capturedInvocation(.{ .user = "/bin/zsh" }, "printf user");
-    try std.testing.expectEqualSlices(
-        []const u8,
-        &.{ "/bin/zsh", "-l", "-i", "-c", "printf user" },
-        zsh_user.argv(),
-    );
+    const zsh_user = try capturedInvocation(arena, .{ .user = "/bin/zsh" }, "printf user");
+    const expected_zsh_user = [_][]const u8{
+        "/bin/zsh",
+        "-l",
+        "-i",
+        "-c",
+        "\\builtin trap - TERM; printf user",
+    };
+    try std.testing.expectEqual(expected_zsh_user.len, zsh_user.argv().len);
+    for (&expected_zsh_user, zsh_user.argv()) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
 }
 
 test "captured invocation provider projection shell-quotes every argv word" {
-    const invocation = try capturedInvocation(.{ .clean = "/bin/zsh" }, "printf '%s' ok");
+    const invocation = try capturedInvocation(std.testing.allocator, .{ .clean = "/bin/zsh" }, "printf '%s' ok");
     const command = try formatInvocationCommand(std.testing.allocator, &invocation);
     defer std.testing.allocator.free(command);
     try std.testing.expectEqualStrings(
@@ -439,8 +500,8 @@ test "unsupported login shell profiles fall back for captured and persistent exe
     try std.testing.expect(user_environment.eql(.{ .user = fallback }));
     try std.testing.expect(clean_environment.eql(.{ .clean = fallback }));
 
-    const user_invocation = try capturedInvocation(user_environment, "printf user");
-    const clean_invocation = try capturedInvocation(clean_environment, "printf clean");
+    const user_invocation = try capturedInvocation(arena, user_environment, "printf user");
+    const clean_invocation = try capturedInvocation(arena, clean_environment, "printf clean");
     try std.testing.expectEqualStrings(fallback, user_invocation.path);
     try std.testing.expectEqualStrings(fallback, clean_invocation.path);
 

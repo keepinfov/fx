@@ -1,10 +1,13 @@
 const std = @import("std");
+const file_picker_path = @import("../input/file_picker_path.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
 const entity_spans = @import("../shared/entity_spans.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
+const image_data = @import("image_data.zig");
 const io_mod = @import("../shared/io.zig");
+const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
 
@@ -12,6 +15,7 @@ pub const max_image_bytes: usize = 20 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
 pub const image_too_large_notice = "image exceeds the 20 MiB limit";
 pub const image_preparation_failed_notice = "Unable to prepare this image for upload. Use a smaller image.";
+pub const model_image_capability_unavailable_notice = "Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const snapshot_digest_hex_len = Sha256.digest_length * 2;
 const transfer_buffer_bytes = 64 * 1024;
@@ -103,23 +107,85 @@ test "image placeholder rewrite projects boundaries and rejects interiors" {
     );
 }
 
+/// The source covers consumed path syntax, not its outside punctuation. Both
+/// ranges are byte offsets; later placeholder-ID changes never mutate this map.
+pub const InlineImageEdit = struct {
+    source: entity_spans.Span,
+    output: entity_spans.Span,
+    id: usize,
+};
+
 pub const ExtractedInlineImages = struct {
     text: []u8,
     images: []types.ImageAttachment,
-    image_spans: []ImagePlaceholderSpan,
+    edits: []InlineImageEdit,
 
     pub fn deinit(self: ExtractedInlineImages, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
         types.freeImageAttachmentSlice(alloc, self.images);
-        alloc.free(self.image_spans);
+        alloc.free(self.edits);
     }
 
     pub fn discard(self: ExtractedInlineImages, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
         discardImageAttachmentSlice(alloc, self.images);
-        alloc.free(self.image_spans);
+        alloc.free(self.edits);
     }
 };
+
+const InlineImageReplacement = struct {
+    source: entity_spans.Span,
+    id: usize,
+};
+
+/// Pure byte transformation. The caller owns both returned allocations.
+fn rewrite_inline_images(alloc: std.mem.Allocator, source: []const u8, replacements: []const InlineImageReplacement) !struct { text: []u8, edits: []InlineImageEdit } {
+    const edits = try alloc.alloc(InlineImageEdit, replacements.len);
+    errdefer alloc.free(edits);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var cursor: usize = 0;
+    for (replacements, edits) |replacement, *edit| {
+        if (!replacement.source.isValid(source.len) or replacement.source.raw_start < cursor or replacement.id == 0) return error.InvalidImageOccurrence;
+        try out.appendSlice(alloc, source[cursor..replacement.source.raw_start]);
+        const start = out.items.len;
+        var buffer: [64]u8 = undefined;
+        try out.appendSlice(alloc, try formatImagePlaceholder(&buffer, replacement.id));
+        edit.* = .{
+            .source = replacement.source,
+            .output = .{ .raw_start = start, .raw_end = out.items.len },
+            .id = replacement.id,
+        };
+        cursor = replacement.source.raw_end;
+    }
+    try out.appendSlice(alloc, source[cursor..]);
+    return .{ .text = try out.toOwnedSlice(alloc), .edits = edits };
+}
+
+/// Projects an existing entity through admitted edits. Consumed entities do not
+/// survive. Edits borrow immutable source/output coordinates from extraction.
+pub fn project_inline_image_span(source_len: usize, span: entity_spans.Span, edits: []const InlineImageEdit) ?entity_spans.Span {
+    if (!span.isValid(source_len)) return null;
+    var source_cursor: usize = 0;
+    var output_cursor: usize = 0;
+    for (edits) |edit| {
+        if (!edit.source.isValid(source_len) or edit.source.raw_start < source_cursor or edit.output.raw_end <= edit.output.raw_start or edit.id == 0) return null;
+        const start = std.math.add(usize, output_cursor, edit.source.raw_start - source_cursor) catch return null;
+        if (edit.output.raw_start != start) return null;
+        source_cursor = edit.source.raw_end;
+        output_cursor = edit.output.raw_end;
+    }
+    _ = std.math.add(usize, output_cursor, source_len - source_cursor) catch return null;
+    var projected = span;
+    var index = edits.len;
+    while (index > 0) {
+        index -= 1;
+        const edit = edits[index];
+        projected = entity_spans.afterDelete(projected, edit.source.raw_start, edit.source.raw_end) orelse return null;
+        projected = entity_spans.afterInsert(projected, edit.source.raw_start, edit.output.raw_end - edit.output.raw_start) orelse return null;
+    }
+    return projected;
+}
 
 pub fn loadImageAttachment(alloc: std.mem.Allocator, path_input: []const u8) !types.ImageAttachment {
     const normalized_path = try normalizePathInput(alloc, path_input);
@@ -136,13 +202,22 @@ pub fn loadUserImageAttachment(
 ) !types.ImageAttachment {
     const normalized_path = try normalizePathInput(alloc, path_input);
     defer alloc.free(normalized_path);
+    // Preserve the raw entry's second trim at the old path-resolution boundary.
+    return load_user_image_literal(alloc, workspace_root, std.mem.trim(u8, normalized_path, " \t\r\n"));
+}
 
+/// Reads a decoded path without changing filename bytes. Caller owns the result.
+fn load_user_image_literal(
+    alloc: std.mem.Allocator,
+    workspace_root: []const u8,
+    path: []const u8,
+) !types.ImageAttachment {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer scratch_state.deinit();
-    const resolved_path = try pathing.resolveWorkspaceOrExternalPath(
+    const resolved_path = try pathing.resolve_workspace_or_external_literal_path(
         scratch_state.allocator(),
         workspace_root,
-        normalized_path,
+        path,
     );
     const owned_path = try alloc.dupe(u8, resolved_path);
     return loadResolvedImageAttachment(alloc, owned_path);
@@ -220,6 +295,7 @@ pub const CaptureBudget = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
     test_hook: if (builtin.is_test) ?TestBudgetHook else void = if (builtin.is_test) null else {},
+    test_resizer: if (builtin.is_test) ?TestResizer else void = if (builtin.is_test) null else {},
 
     pub fn check(self: CaptureBudget) !void {
         if (comptime builtin.is_test) {
@@ -291,6 +367,13 @@ pub fn captureImageAttachmentsForAdmission(
 const TestBudgetHook = struct {
     ctx: *anyopaque,
     check: *const fn (*anyopaque) anyerror!void,
+};
+
+/// Replaces the platform resizer in tests with a shell script that receives
+/// the source and output paths as `$1` and `$2`.
+const TestResizer = struct {
+    script: []const u8,
+    timeout: std.Io.Clock.Duration = image_normalization_timeout,
 };
 
 pub fn captureImageSnapshot(
@@ -469,6 +552,135 @@ pub fn captureBoundImageAttachment(
     return attachment;
 }
 
+/// Captures caller-supplied image bytes into the immutable session snapshot
+/// contract. The caller owns the returned attachment and must release it with
+/// `types.freeImageAttachment` or `discardImageAttachment`.
+pub fn captureInlineImageBytes(
+    alloc: std.mem.Allocator,
+    image_id: usize,
+    declared_media_type: []const u8,
+    bytes: []const u8,
+    snapshot_dir: []const u8,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
+    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+    // Only a PNG over the pixel limit can come under the byte limit, by being
+    // downscaled during capture.
+    const over_bytes = !fitsEncodedLimit(bytes.len);
+    if (over_bytes and !pngExceedsModelDimensions(bytes)) return error.ImageTooLarge;
+    // Validate the declared type against the caller's bytes: normalization may
+    // legitimately change the snapshot's type.
+    const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
+
+    var snapshot_dir_handle = try openOrCreateSnapshotDirectoryNoFollow(snapshot_dir);
+    defer snapshot_dir_handle.close(io_mod.getIo());
+    var random_suffix: u64 = undefined;
+    io_mod.getIo().random(std.mem.asBytes(&random_suffix));
+    const source_name = try std.fmt.allocPrint(
+        alloc,
+        "image-{d}.acp-source.{x}",
+        .{ image_id, random_suffix },
+    );
+    defer alloc.free(source_name);
+    defer deleteSnapshotFile(snapshot_dir_handle, source_name, "capture_acp_source");
+
+    {
+        var source = try snapshot_dir_handle.createFile(
+            io_mod.getIo(),
+            source_name,
+            .{
+                .truncate = false,
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o600),
+                .resolve_beneath = true,
+            },
+        );
+        defer source.close(io_mod.getIo());
+        try source.writeStreamingAll(io_mod.getIo(), bytes);
+        try source.sync(io_mod.getIo());
+    }
+
+    const source_path = try std.fs.path.join(alloc, &.{ snapshot_dir, source_name });
+    defer alloc.free(source_path);
+    var attachment = types.ImageAttachment{
+        .id = image_id,
+        .path = try alloc.dupe(u8, source_path),
+        .media_type = try alloc.dupe(u8, declared_media_type),
+    };
+    errdefer discardImageAttachment(alloc, attachment);
+    captureImageSnapshot(alloc, &attachment, snapshot_dir) catch |err| switch (err) {
+        error.ImagePreparationFailed => return if (over_bytes) error.ImageTooLarge else err,
+        else => return err,
+    };
+
+    const durable_path = try alloc.dupe(
+        u8,
+        attachment.snapshot_path orelse return error.MissingImageSnapshot,
+    );
+    alloc.free(attachment.path);
+    attachment.path = durable_path;
+    return attachment;
+}
+
+/// Captures caller-supplied image bytes for sessions without a filesystem
+/// snapshot backend (libfx kernel sessions on native and wasm). Applies the
+/// same size, media-type, and digest validation as the filesystem capture,
+/// but retains the decoded bytes on the attachment itself so request building
+/// and checkpoint serialization never touch a filesystem.
+/// The caller owns the returned attachment and must release it with
+/// `types.freeImageAttachment` or `discardImageAttachment`.
+pub fn captureInlineImageBytesInMemory(
+    alloc: std.mem.Allocator,
+    image_id: usize,
+    declared_media_type: []const u8,
+    bytes: []const u8,
+) !types.ImageAttachment {
+    if (image_id == 0) return error.InvalidImageId;
+    if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
+    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+    const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
+    if (!std.mem.eql(u8, detected, declared_media_type)) return error.ImageSnapshotMediaTypeMismatch;
+
+    // Without a snapshot directory there is no platform resizer, so only
+    // PNGs shrink here; other oversized images are withheld with a note when
+    // requests are built.
+    const owned_bytes = owned: {
+        if (try png_downscale.downscaleOversized(alloc, detected, bytes)) |smaller| {
+            if (fitsEncodedLimit(smaller.png.len)) break :owned smaller.png;
+            alloc.free(smaller.png);
+        }
+        break :owned try alloc.dupe(u8, bytes);
+    };
+    errdefer alloc.free(owned_bytes);
+    if (!fitsEncodedLimit(owned_bytes.len)) return error.ImageTooLarge;
+    const owned_path = try std.fmt.allocPrint(alloc, inline_image_path_prefix ++ "{d}", .{image_id});
+    errdefer alloc.free(owned_path);
+    const owned_media_type = try alloc.dupe(u8, declared_media_type);
+    errdefer alloc.free(owned_media_type);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(owned_bytes, &digest, .{});
+    const digest_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    errdefer alloc.free(digest_hex);
+    return .{
+        .id = image_id,
+        .path = owned_path,
+        .media_type = owned_media_type,
+        .snapshot_sha256 = digest_hex,
+        .inline_data = owned_bytes,
+    };
+}
+
+pub const inline_image_path_prefix = "inline://image-";
+
+fn pngExceedsModelDimensions(bytes: []const u8) bool {
+    const media_type = detectMediaTypeFromBytes(bytes) orelse return false;
+    if (!png_downscale.supportsMediaType(media_type)) return false;
+    const dimensions = image_data.imageDimensions(bytes) orelse return false;
+    return dimensions.exceedsModelLimit();
+}
+
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,
     attachment: *types.ImageAttachment,
@@ -516,9 +728,17 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         );
     };
 
-    if (!fitsEncodedLimit(source_metadata.size_bytes)) {
-        if (comptime builtin.os.tag != .macos) return error.ImagePreparationFailed;
-
+    // PNGs over the pixel limit shrink in process on every platform, which
+    // also brings most byte-oversized screenshots under the byte limit. Other
+    // sources need the platform resizer: byte-oversized ones can never be
+    // sent, so they fail without it, and pixel-oversized ones are kept for
+    // request building to withhold with a note.
+    const can_normalize = comptime builtin.os.tag == .macos;
+    const over_bytes = !fitsEncodedLimit(source_metadata.size_bytes);
+    const over_pixels = try snapshotExceedsModelDimensions(snapshot_dir_handle, source_temp_name, budget);
+    const shrink_in_process = over_pixels and png_downscale.supportsMediaType(source_metadata.media_type);
+    if (over_bytes and !can_normalize and !shrink_in_process) return error.ImagePreparationFailed;
+    if (over_bytes or shrink_in_process or (over_pixels and can_normalize)) {
         var candidate_suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&candidate_suffix));
         candidate_temp_name = try std.fmt.allocPrint(
@@ -550,16 +770,48 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         );
         defer alloc.free(candidate_temp_path);
 
-        prepareImageCandidate(source_temp_path, candidate_temp_path, budget) catch |err| switch (err) {
-            error.FileNotFound => return error.ImagePreparationFailed,
-            else => return err,
-        };
-        metadata = try inspectImageCandidate(
+        var candidate_metadata: ?SnapshotMetadata = null;
+        if (shrink_in_process and try downscalePngSnapshot(
+            alloc,
             snapshot_dir_handle,
+            source_temp_name,
+            source_metadata.size_bytes,
             candidate_temp_name.?,
             budget,
-        );
-        selected_temp_name = candidate_temp_name.?;
+        )) {
+            candidate_metadata = try inspectImageCandidate(
+                snapshot_dir_handle,
+                candidate_temp_name.?,
+                budget,
+            );
+            if (try snapshotExceedsModelDimensions(snapshot_dir_handle, candidate_temp_name.?, budget)) {
+                return error.ImagePreparationFailed;
+            }
+        } else if (can_normalize) {
+            switch (try resizeWithPlatformTool(
+                snapshot_dir_handle,
+                source_temp_path,
+                candidate_temp_name.?,
+                candidate_temp_path,
+                budget,
+            )) {
+                .resized => |resized| candidate_metadata = resized,
+                .failed => |reason| debug_trace.logf(
+                    "images",
+                    "event=image_normalizer_failed reason={s} fallback={s}",
+                    .{ reason, if (over_bytes) "reject" else "keep_source" },
+                ),
+            }
+        }
+        // A source that could not be converted keeps its bytes when it fits
+        // the byte limit, and request building withholds it with a note. The
+        // unused candidate file is deleted on return.
+        if (candidate_metadata) |candidate| {
+            metadata = candidate;
+            selected_temp_name = candidate_temp_name.?;
+        } else if (over_bytes) {
+            return error.ImagePreparationFailed;
+        }
     }
 
     const media_type = try alloc.dupe(u8, metadata.media_type);
@@ -669,6 +921,199 @@ const SnapshotMetadata = struct {
     size_bytes: usize,
 };
 
+/// Reads a snapshot file on demand for pixel-size checks, so a JPEG frame
+/// header behind large metadata is found without reading the whole file.
+const SnapshotFileReader = struct {
+    file: std.Io.File,
+
+    fn readAt(context: *const anyopaque, offset: u64, buffer: []u8) []const u8 {
+        const self: *const SnapshotFileReader = @ptrCast(@alignCast(context));
+        const len = self.file.readPositionalAll(io_mod.getIo(), buffer, offset) catch return buffer[0..0];
+        return buffer[0..len];
+    }
+
+    fn dimensions(self: *const SnapshotFileReader) ?image_data.Dimensions {
+        return image_data.positionalImageDimensions(.{ .context = self, .read_at = readAt });
+    }
+};
+
+/// Reports whether a snapshot file is wider or taller than the model pixel
+/// limit. Unreadable dimensions report false and keep the byte-limit path.
+fn snapshotExceedsModelDimensions(dir: std.Io.Dir, name: []const u8, budget: CaptureBudget) !bool {
+    try budget.check();
+    var file = dir.openFile(io_mod.getIo(), name, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound, error.IsDir, error.NotDir, error.SymLinkLoop => return error.ImagePreparationFailed,
+        else => return err,
+    };
+    defer file.close(io_mod.getIo());
+    const reader: SnapshotFileReader = .{ .file = file };
+    const dimensions = reader.dimensions() orelse return false;
+    return dimensions.exceedsModelLimit();
+}
+
+/// Writes a copy of a PNG snapshot, shrunk to the model pixel limit, into
+/// `candidate_name`. Returns false when the PNG cannot be decoded here or the
+/// copy would exceed the encoded size limit, leaving the caller to fall back.
+fn downscalePngSnapshot(
+    alloc: std.mem.Allocator,
+    dir: std.Io.Dir,
+    source_name: []const u8,
+    source_size: usize,
+    candidate_name: []const u8,
+    budget: CaptureBudget,
+) !bool {
+    try budget.check();
+    const source_bytes = try alloc.alloc(u8, source_size);
+    defer alloc.free(source_bytes);
+    {
+        var source = dir.openFile(io_mod.getIo(), source_name, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.IsDir, error.NotDir, error.SymLinkLoop => return error.ImagePreparationFailed,
+            else => return err,
+        };
+        defer source.close(io_mod.getIo());
+        var read_buffer: [8192]u8 = undefined;
+        var reader = source.readerStreaming(io_mod.getIo(), &read_buffer);
+        reader.interface.readSliceAll(source_bytes) catch return error.ImagePreparationFailed;
+    }
+    const smaller = try png_downscale.downscaleOversized(alloc, "image/png", source_bytes) orelse return false;
+    defer alloc.free(smaller.png);
+    if (!fitsEncodedLimit(smaller.png.len)) return false;
+    try budget.check();
+    var candidate = try dir.createFile(io_mod.getIo(), candidate_name, .{
+        .truncate = true,
+        .resolve_beneath = true,
+    });
+    defer candidate.close(io_mod.getIo());
+    try candidate.writeStreamingAll(io_mod.getIo(), smaller.png);
+    try candidate.sync(io_mod.getIo());
+    return true;
+}
+
+/// Pixel sizes of attachment snapshots already read, keyed by snapshot
+/// digest. Snapshot contents never change, so each is read once while the
+/// cache lives. Keys are owned by the allocator passed alongside the cache.
+pub const AttachmentDimensionCache = std.StringHashMapUnmanaged(?image_data.Dimensions);
+
+/// Pixel size of an attachment, or null when it cannot be read. Unreadable
+/// snapshots are reported where the request loads them.
+fn attachmentDimensions(
+    cache_alloc: std.mem.Allocator,
+    cache: *AttachmentDimensionCache,
+    attachment: types.ImageAttachment,
+) std.mem.Allocator.Error!?image_data.Dimensions {
+    if (attachment.inline_data) |bytes| return image_data.imageDimensions(bytes);
+    const path = attachment.snapshot_path orelse return null;
+    const digest = attachment.snapshot_sha256 orelse return probeSnapshotDimensions(path);
+    if (cache.get(digest)) |cached| return cached;
+    const dimensions = probeSnapshotDimensions(path);
+    const key = try cache_alloc.dupe(u8, digest);
+    errdefer cache_alloc.free(key);
+    try cache.put(cache_alloc, key, dimensions);
+    return dimensions;
+}
+
+fn probeSnapshotDimensions(path: []const u8) ?image_data.Dimensions {
+    var file = openSnapshotFileNoFollow(path) catch return null;
+    defer file.close(io_mod.getIo());
+    const reader: SnapshotFileReader = .{ .file = file };
+    return reader.dimensions();
+}
+
+fn writeWithheldAttachmentNotice(
+    writer: *std.Io.Writer,
+    attachment: types.ImageAttachment,
+    dimensions: image_data.Dimensions,
+) std.Io.Writer.Error!void {
+    const limit = image_data.max_image_dimension;
+    try writer.print(
+        "[Image #{d} not sent: {s} is {d}x{d} pixels, over the {d}-pixel limit per side.",
+        .{ attachment.id, attachment.media_type, dimensions.width, dimensions.height, limit },
+    );
+    if (attachment.inline_data == null) {
+        if (attachment.snapshot_path) |path| {
+            try writer.print(" It is saved at {s}. Save a copy at most {d} pixels per side to a new file", .{ path, limit });
+            // Snapshots are named .bin, which hides the type from tools
+            // that choose a decoder by file name.
+            if (mediaTypeExtension(attachment.media_type)) |extension| {
+                try writer.print(" ending in {s}", .{extension});
+            }
+            try writer.writeAll(" without changing this one, then read the copy.]\n");
+            return;
+        }
+    }
+    try writer.print(" Ask for a copy at most {d} pixels per side.]\n", .{limit});
+}
+
+fn mediaTypeExtension(media_type: []const u8) ?[]const u8 {
+    const extensions = [_]struct { []const u8, []const u8 }{
+        .{ "image/png", ".png" },
+        .{ "image/jpeg", ".jpg" },
+        .{ "image/gif", ".gif" },
+        .{ "image/webp", ".webp" },
+    };
+    for (extensions) |entry| {
+        if (std.mem.eql(u8, media_type, entry[0])) return entry[1];
+    }
+    return null;
+}
+
+pub const AttachmentProjection = struct {
+    messages: []const types.ChatMessage,
+    /// Ids of the attachments left out of the request, in message order.
+    withheld_ids: []const usize = &.{},
+};
+
+/// Leaves attachments over the model pixel limit out of a request and tells
+/// the model where each one is saved, so it can shrink the file and read the
+/// smaller copy. These are formats fx cannot downscale on this platform and
+/// images saved before downscaling existed. History is not modified; input
+/// without such attachments is returned unchanged. `cache` and its keys use
+/// `cache_alloc` and should outlive the requests of one turn.
+pub fn withholdOversizedAttachments(
+    arena: std.mem.Allocator,
+    cache_alloc: std.mem.Allocator,
+    cache: *AttachmentDimensionCache,
+    messages: []const types.ChatMessage,
+) !AttachmentProjection {
+    var result: ?[]types.ChatMessage = null;
+    var withheld_ids: std.ArrayList(usize) = .empty;
+    for (messages, 0..) |message, index| {
+        if (message.images.len == 0) continue;
+        var kept: ?std.ArrayList(types.ImageAttachment) = null;
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        for (message.images, 0..) |image, image_index| {
+            const dimensions = try attachmentDimensions(cache_alloc, cache, image);
+            const oversized = if (dimensions) |size| size.exceedsModelLimit() else false;
+            if (!oversized) {
+                if (kept) |*list| list.appendAssumeCapacity(image);
+                continue;
+            }
+            if (kept == null) {
+                kept = try .initCapacity(arena, message.images.len);
+                kept.?.appendSliceAssumeCapacity(message.images[0..image_index]);
+            }
+            try withheld_ids.append(arena, image.id);
+            debug_trace.logf("images", "event=attachment_withheld image_id={d} media_type={s} width={d} height={d} max_dimension={d}", .{ image.id, image.media_type, dimensions.?.width, dimensions.?.height, image_data.max_image_dimension });
+            writeWithheldAttachmentNotice(&notice.writer, image, dimensions.?) catch return error.OutOfMemory;
+        }
+        const kept_images = kept orelse continue;
+
+        const projected = result orelse try arena.dupe(types.ChatMessage, messages);
+        result = projected;
+        projected[index].images = kept_images.items;
+        projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
+    }
+    return .{ .messages = result orelse messages, .withheld_ids = withheld_ids.items };
+}
+
 fn fitsEncodedLimit(raw_bytes: usize) bool {
     const rounded = std.math.add(usize, raw_bytes, 2) catch return false;
     const groups = @divTrunc(rounded, 3);
@@ -703,6 +1148,7 @@ fn waitForImageNormalizer(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !std.process.Child.Term {
+    const pid = child.id.?;
     var select_buffer: [3]ImageNormalizerEvent = undefined;
     var select: std.Io.Select(ImageNormalizerEvent) = .init(
         io_mod.getIo(),
@@ -715,7 +1161,7 @@ fn waitForImageNormalizer(
         waitForImageNormalizerTimeout,
         .{deadline},
     ) catch |err| {
-        select.cancelDiscard();
+        stopImageNormalizer(&select, pid);
         return err;
     };
     if (cancel_flag) |flag| {
@@ -724,13 +1170,13 @@ fn waitForImageNormalizer(
             waitForImageNormalizerCancellation,
             .{flag},
         ) catch |err| {
-            select.cancelDiscard();
+            stopImageNormalizer(&select, pid);
             return err;
         };
     }
 
     const event = select.await() catch |err| {
-        select.cancelDiscard();
+        stopImageNormalizer(&select, pid);
         return err;
     };
     return switch (event) {
@@ -739,27 +1185,46 @@ fn waitForImageNormalizer(
             break :blk result catch |err| return err;
         },
         .timeout => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
+            stopImageNormalizer(&select, pid);
+            try result;
             return error.TimedOut;
         },
         .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
+            stopImageNormalizer(&select, pid);
+            try result;
             return error.Cancelled;
         },
     };
 }
 
+/// Kills a resizer that is still running, then waits for the pending wait
+/// task to collect it. Canceling that task instead would leave the process
+/// running and never collected, free to write its output later. Cancelation
+/// of the calling task stays pending until the process is collected.
+fn stopImageNormalizer(
+    select: *std.Io.Select(ImageNormalizerEvent),
+    pid: std.process.Child.Id,
+) void {
+    const io = io_mod.getIo();
+    const cancel_protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(cancel_protection);
+    std.posix.kill(pid, .KILL) catch |err| debug_trace.logf(
+        "images",
+        "event=image_normalizer_kill_failed err={s}",
+        .{@errorName(err)},
+    );
+    while (select.await()) |event| {
+        if (event == .wait) break;
+    } else |_| {}
+    select.cancelDiscard();
+}
+
+/// Runs a resizer process until it exits or its deadline passes: the budget's
+/// deadline when it has one, otherwise `timeout` from now.
 fn runImageNormalizerProcess(
     argv: []const []const u8,
     budget: CaptureBudget,
+    timeout: std.Io.Clock.Duration,
 ) !void {
     try budget.check();
     var child = try std.process.spawn(io_mod.getIo(), .{
@@ -771,7 +1236,7 @@ fn runImageNormalizerProcess(
     defer child.kill(io_mod.getIo());
 
     const deadline = budget.deadline orelse
-        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), image_normalization_timeout);
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), timeout);
     const term = try waitForImageNormalizer(&child, deadline, budget.cancel_flag);
     switch (term) {
         .exited => |code| if (code != 0) return error.ImagePreparationFailed,
@@ -779,11 +1244,52 @@ fn runImageNormalizerProcess(
     }
 }
 
+const ResizeResult = union(enum) {
+    resized: SnapshotMetadata,
+    /// Why the resizer output cannot be used, for the trace log.
+    failed: []const u8,
+};
+
+/// Runs the platform resizer on the source and checks its output. A resizer
+/// failure, its own time limit, and output that cannot be sent are reported
+/// as `.failed`, so the caller decides whether to keep or reject the source.
+/// Cancellation and an expired capture deadline are returned as errors.
+fn resizeWithPlatformTool(
+    snapshot_dir: std.Io.Dir,
+    source_path: []const u8,
+    candidate_name: []const u8,
+    candidate_path: []const u8,
+    budget: CaptureBudget,
+) !ResizeResult {
+    prepareImageCandidate(source_path, candidate_path, budget) catch |err| switch (err) {
+        error.FileNotFound, error.ImagePreparationFailed => return .{ .failed = @errorName(err) },
+        error.TimedOut => {
+            try budget.check();
+            return .{ .failed = "resizer_timeout" };
+        },
+        else => return err,
+    };
+    const metadata = inspectImageCandidate(snapshot_dir, candidate_name, budget) catch |err| switch (err) {
+        error.ImagePreparationFailed => return .{ .failed = "unusable_output" },
+        else => return err,
+    };
+    if (try snapshotExceedsModelDimensions(snapshot_dir, candidate_name, budget)) {
+        return .{ .failed = "output_over_pixel_limit" };
+    }
+    return .{ .resized = metadata };
+}
+
 fn prepareImageCandidate(
     source_path: []const u8,
     candidate_path: []const u8,
     budget: CaptureBudget,
 ) !void {
+    if (comptime builtin.is_test) {
+        if (budget.test_resizer) |resizer| {
+            const argv = [_][]const u8{ "/bin/sh", "-c", resizer.script, "resizer", source_path, candidate_path };
+            return runImageNormalizerProcess(&argv, budget, resizer.timeout);
+        }
+    }
     const argv = [_][]const u8{
         "/usr/bin/sips",
         "-s",
@@ -793,12 +1299,12 @@ fn prepareImageCandidate(
         "formatOptions",
         "85",
         "-Z",
-        "2000",
+        std.fmt.comptimePrint("{d}", .{image_data.max_image_dimension}),
         source_path,
         "--out",
         candidate_path,
     };
-    try runImageNormalizerProcess(&argv, budget);
+    try runImageNormalizerProcess(&argv, budget, image_normalization_timeout);
 }
 
 fn inspectImageCandidate(
@@ -1005,6 +1511,23 @@ pub fn loadVerifiedSnapshot(
     attachment: types.ImageAttachment,
     budget: CaptureBudget,
 ) !VerifiedSnapshot {
+    if (attachment.inline_data) |inline_bytes| {
+        const expected_inline = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
+        if (expected_inline.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
+        try budget.check();
+        if (inline_bytes.len > max_image_bytes) return error.ImageTooLarge;
+        var actual: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(inline_bytes, &actual, .{});
+        const actual_hex = std.fmt.bytesToHex(actual, .lower);
+        if (!std.mem.eql(u8, actual_hex[0..], expected_inline)) return error.ImageSnapshotCorrupt;
+        const detected = detectMediaTypeFromBytes(inline_bytes) orelse
+            return error.UnsupportedImageType;
+        if (!std.mem.eql(u8, detected, attachment.media_type)) return error.ImageSnapshotMediaTypeMismatch;
+        return .{
+            .bytes = try alloc.dupe(u8, inline_bytes),
+            .media_type = detected,
+        };
+    }
     const path = attachment.snapshot_path orelse return error.MissingImageSnapshot;
     const expected = attachment.snapshot_sha256 orelse return error.MissingImageSnapshot;
     if (expected.len != snapshot_digest_hex_len) return error.InvalidImageSnapshotDigest;
@@ -1589,7 +2112,7 @@ pub fn writeVerifiedImageFilePartJsonWithBudget(
 
     try writer.writeAll("{\"type\":\"file\",\"mediaType\":\"");
     try writer.writeAll(snapshot.media_type);
-    try writer.writeAll("\",\"data\":\"");
+    try writer.writeAll("\",\"data\":{\"type\":\"data\",\"data\":\"");
 
     var offset: usize = 0;
     while (offset < snapshot.bytes.len) {
@@ -1599,7 +2122,7 @@ pub fn writeVerifiedImageFilePartJsonWithBudget(
         offset = end;
     }
 
-    try writer.writeAll("\"}");
+    try writer.writeAll("\"}}");
     try budget.check();
 }
 
@@ -1609,91 +2132,51 @@ pub fn extractInlineImageAttachments(
     text: []const u8,
     first_image_id: usize,
 ) !ExtractedInlineImages {
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    errdefer output.deinit();
-
     var images: std.ArrayList(types.ImageAttachment) = .empty;
     errdefer {
         for (images.items) |image| types.freeImageAttachment(alloc, image);
         images.deinit(alloc);
     }
-    var image_spans: std.ArrayList(ImagePlaceholderSpan) = .empty;
-    errdefer image_spans.deinit(alloc);
+    var replacements: std.ArrayList(InlineImageReplacement) = .empty;
+    defer replacements.deinit(alloc);
 
-    var i: usize = 0;
+    var index: usize = 0;
     while (true) {
-        while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
-        if (i >= text.len) break;
-
-        const start = i;
-        const end = nextShellTokenEnd(text, start);
-        const raw = text[start..end];
-        i = end;
-
-        if (splitImagePathToken(raw)) |token| {
-            const attachment = loadUserImageAttachment(alloc, workspace_root, token.path) catch |err| switch (err) {
-                error.FileNotFound,
-                error.HomeNotSet,
-                error.InvalidPath,
-                error.NotRegularFile,
-                error.UnsupportedImageType,
-                => blk: {
-                    debug_trace.logf(
-                        "images",
-                        "event=inline_image_promotion_skipped reason={s}",
-                        .{@errorName(err)},
-                    );
-                    try appendToken(&output.writer, raw);
-                    break :blk null;
-                },
-                else => return err,
-            };
-            if (attachment) |loaded_image| {
-                var image = loaded_image;
-                var owns_image = true;
-                errdefer if (owns_image) types.freeImageAttachment(alloc, image);
-                image.id = try std.math.add(usize, first_image_id, images.items.len);
-                try images.append(alloc, image);
-                owns_image = false;
-                var placeholder_buf: [64]u8 = undefined;
-                const placeholder = try formatImagePlaceholder(&placeholder_buf, image.id);
-                const placeholder_start = output.written().len + @intFromBool(output.written().len > 0);
-                try appendToken(&output.writer, placeholder);
-                try image_spans.append(alloc, .{
-                    .start = placeholder_start,
-                    .end = placeholder_start + placeholder.len,
-                    .id = image.id,
-                });
-                try output.writer.writeAll(token.suffix);
+        while (index < text.len and isWhitespace(text[index])) : (index += 1) {}
+        if (index == text.len) break;
+        const start = index;
+        index = nextShellTokenEnd(text, start);
+        const token = splitImagePathToken(text[start..index]) orelse continue;
+        var image = load_inline_image_attachment(alloc, workspace_root, token) catch |err| switch (err) {
+            error.FileNotFound,
+            error.HomeNotSet,
+            error.InvalidPath,
+            error.NotRegularFile,
+            error.UnsupportedImageType,
+            => {
+                debug_trace.logf("images", "event=inline_image_promotion_skipped reason={s}", .{@errorName(err)});
                 continue;
-            }
-        } else {
-            try appendToken(&output.writer, raw);
-        }
+            },
+            else => return err,
+        };
+        var owns_image = true;
+        errdefer if (owns_image) types.freeImageAttachment(alloc, image);
+        image.id = std.math.add(usize, first_image_id, images.items.len) catch return error.ImageIdOverflow;
+        if (image.id == 0) return error.InvalidImageId;
+        _ = std.math.add(usize, image.id, 1) catch return error.ImageIdOverflow;
+        try images.ensureUnusedCapacity(alloc, 1);
+        try replacements.append(alloc, .{
+            .source = .{ .raw_start = start, .raw_end = index - token.suffix.len },
+            .id = image.id,
+        });
+        images.appendAssumeCapacity(image);
+        owns_image = false;
     }
 
     const owned_images = try images.toOwnedSlice(alloc);
     errdefer types.freeImageAttachmentSlice(alloc, owned_images);
-    const owned_spans = try image_spans.toOwnedSlice(alloc);
-    errdefer alloc.free(owned_spans);
-    const compact = std.mem.trim(u8, output.written(), " \t\r\n");
-    const owned = try output.toOwnedSlice();
-    errdefer alloc.free(owned);
-    if (compact.len != owned.len) {
-        const trimmed = try alloc.dupe(u8, compact);
-        alloc.free(owned);
-        return .{
-            .text = trimmed,
-            .images = owned_images,
-            .image_spans = owned_spans,
-        };
-    }
-
-    return .{
-        .text = owned,
-        .images = owned_images,
-        .image_spans = owned_spans,
-    };
+    const rewritten = try rewrite_inline_images(alloc, text, replacements.items);
+    return .{ .text = rewritten.text, .images = owned_images, .edits = rewritten.edits };
 }
 
 pub const ClipboardImageAttachment = struct {
@@ -1805,36 +2288,54 @@ fn normalizePathInput(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn detectMediaTypeFromBytes(bytes: []const u8) ?[]const u8 {
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
-    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
-    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
-    return null;
-}
+const detectMediaTypeFromBytes = @import("image_data.zig").detectMediaTypeFromBytes;
 
 pub const ImagePathToken = struct {
     path: []const u8,
     suffix: []const u8,
+    /// Canonical @ payload without quotes; decode once before literal loading.
+    literal_payload: bool = false,
 };
+
+/// Loads one parsed image token. Caller owns the returned attachment.
+pub fn load_inline_image_attachment(alloc: std.mem.Allocator, workspace_root: []const u8, token: ImagePathToken) !types.ImageAttachment {
+    if (!token.literal_payload) return loadUserImageAttachment(alloc, workspace_root, token.path);
+    const path = try file_picker_path.decode_alloc(alloc, token.path);
+    defer alloc.free(path);
+    return load_user_image_literal(alloc, workspace_root, path);
+}
 
 pub fn splitImagePathToken(raw: []const u8) ?ImagePathToken {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "@\"")) {
+        const token = file_picker_path.parse_at(trimmed, 0) orelse return null;
+        if (token.status != .complete or token.end != trimmed.len) return null;
+        if (token.canonical_escapes) {
+            const payload = trimmed[token.path_start..token.path_end];
+            var storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const decoded = file_picker_path.decode_into(payload, &storage) catch return null;
+            const dot = std.mem.lastIndexOfScalar(u8, decoded, '.') orelse return null;
+            if (!supported_path_extension(decoded[dot..])) return null;
+            return .{ .path = payload, .suffix = trimmed[token.quote_end.?..], .literal_payload = true };
+        }
+        // Noncanonical escapes keep legacy eligibility (notably backslash-dot).
+    }
     const path_start: usize = if (std.mem.startsWith(u8, trimmed, "@")) 1 else 0;
     if (path_start == 1 and std.mem.startsWith(u8, trimmed[path_start..], "@")) return null;
     const suffix_start = trailingSentencePunctuationStart(trimmed);
     if (path_start >= suffix_start) return null;
     const path = trimmed[path_start..suffix_start];
     const ext = extensionIgnoringEscapes(stripBalancedOuterQuotes(path));
-    if (!(std.ascii.eqlIgnoreCase(ext, ".png") or
+    if (!supported_path_extension(ext)) return null;
+    return .{ .path = path, .suffix = trimmed[suffix_start..] };
+}
+
+fn supported_path_extension(ext: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(ext, ".png") or
         std.ascii.eqlIgnoreCase(ext, ".jpg") or
         std.ascii.eqlIgnoreCase(ext, ".jpeg") or
         std.ascii.eqlIgnoreCase(ext, ".gif") or
-        std.ascii.eqlIgnoreCase(ext, ".webp")))
-    {
-        return null;
-    }
-    return .{ .path = path, .suffix = trimmed[suffix_start..] };
+        std.ascii.eqlIgnoreCase(ext, ".webp");
 }
 
 pub fn looksLikeImagePathToken(raw: []const u8) bool {
@@ -1911,41 +2412,10 @@ fn extensionIgnoringEscapes(raw: []const u8) []const u8 {
     return if (dot_index) |idx| raw[idx..] else "";
 }
 
-pub fn nextShellTokenEnd(text: []const u8, start: usize) usize {
-    var i = start;
-    var quote: ?u8 = null;
-    while (i < text.len) : (i += 1) {
-        const ch = text[i];
-        if (quote) |q| {
-            if (ch == '\\' and i + 1 < text.len) {
-                i += 1;
-                continue;
-            }
-            if (ch == q) quote = null;
-            continue;
-        }
-
-        if (ch == '\\' and i + 1 < text.len) {
-            i += 1;
-            continue;
-        }
-        if (ch == '"' or ch == '\'') {
-            quote = ch;
-            continue;
-        }
-        if (isWhitespace(ch)) break;
-    }
-    return i;
-}
+pub const nextShellTokenEnd = file_picker_path.token_end;
 
 pub fn isWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
-}
-
-fn appendToken(writer: *std.Io.Writer, raw: []const u8) !void {
-    if (raw.len == 0) return;
-    if (writer.buffered().len > 0) try writer.writeByte(' ');
-    try writer.writeAll(raw);
 }
 
 test "writeImageBadge emits OSC 8 hyperlink wrapping the badge" {
@@ -2498,6 +2968,106 @@ test "hasImagePathToken detects image-looking shell tokens without filesystem ac
     try std.testing.expect(!hasImagePathToken("hello /tmp/not-image.txt"));
 }
 
+test "inline image edits preserve outer multiline whitespace and stable digit boundaries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first.png", "second.png" }) |path| {
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "\x89PNG\r\n\x1a\nfixture" });
+    }
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const source = " \tExplain\n  block @./first.png,\n$review @./second.png  \r\n";
+    const result = try extractInlineImageAttachments(alloc, root, source, 9);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings(" \tExplain\n  block [Image #9],\n$review [Image #10]  \r\n", result.text);
+    try std.testing.expectEqual(@as(usize, 2), result.images.len);
+    try std.testing.expectEqual(@as(usize, 9), result.images[0].id);
+    try std.testing.expectEqual(@as(usize, 10), result.images[1].id);
+    try std.testing.expectEqual(@as(usize, 2), result.edits.len);
+    for (result.edits, [_][]const u8{ "@./first.png", "@./second.png" }, [_][]const u8{ "[Image #9]", "[Image #10]" }) |edit, raw, placeholder| {
+        try std.testing.expectEqualStrings(raw, source[edit.source.raw_start..edit.source.raw_end]);
+        try std.testing.expectEqualStrings(placeholder, result.text[edit.output.raw_start..edit.output.raw_end]);
+    }
+    const skill_start = std.mem.find(u8, source, "$review").?;
+    const skill = project_inline_image_span(source.len, .{ .raw_start = skill_start, .raw_end = skill_start + "$review".len }, result.edits).?;
+    try std.testing.expectEqualStrings("$review", result.text[skill.raw_start..skill.raw_end]);
+    try std.testing.expectError(error.ImageIdOverflow, extractInlineImageAttachments(alloc, root, "@./first.png", std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidImageId, extractInlineImageAttachments(alloc, root, "@./first.png", 0));
+}
+
+test "inline image edits are pure lossless replacements with half open maps" {
+    const alloc = std.testing.allocator;
+    const source = "aXbYYc";
+    const replacements = [_]InlineImageReplacement{
+        .{ .source = .{ .raw_start = 1, .raw_end = 2 }, .id = 9 },
+        .{ .source = .{ .raw_start = 3, .raw_end = 5 }, .id = 10 },
+    };
+    const result = try rewrite_inline_images(alloc, source, &replacements);
+    defer alloc.free(result.text);
+    defer alloc.free(result.edits);
+    try std.testing.expectEqualStrings("a[Image #9]b[Image #10]c", result.text);
+    for ([_]usize{ 0, 2, 5 }, [_][]const u8{ "a", "b", "c" }) |start, expected| {
+        const projected = project_inline_image_span(source.len, .{ .raw_start = start, .raw_end = start + 1 }, result.edits).?;
+        try std.testing.expectEqualStrings(expected, result.text[projected.raw_start..projected.raw_end]);
+    }
+    try std.testing.expect(project_inline_image_span(source.len, replacements[0].source, result.edits) == null);
+    try std.testing.expect(project_inline_image_span(source.len, .{ .raw_start = 0, .raw_end = 2 }, result.edits) == null);
+    var bad = result.edits[0];
+    bad.output.raw_start += 1;
+    try std.testing.expect(project_inline_image_span(source.len, .{ .raw_start = 0, .raw_end = 1 }, &.{bad}) == null);
+    const unchanged = try rewrite_inline_images(alloc, " \t\r\n[Image #9] \n", &.{});
+    defer alloc.free(unchanged.text);
+    defer alloc.free(unchanged.edits);
+    try std.testing.expectEqualStrings(" \t\r\n[Image #9] \n", unchanged.text);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.edits.len);
+    try std.testing.expectError(error.InvalidImageOccurrence, rewrite_inline_images(alloc, source, &.{ replacements[1], replacements[0] }));
+    try std.testing.checkAllAllocationFailures(alloc, struct {
+        fn check(a: std.mem.Allocator, text: []const u8, edits: []const InlineImageReplacement) !void {
+            const rewritten = try rewrite_inline_images(a, text, edits);
+            defer a.free(rewritten.text);
+            defer a.free(rewritten.edits);
+        }
+    }.check, .{ source, @as([]const InlineImageReplacement, &replacements) });
+}
+
+test "canonical at images load exact filenames and preserve legacy eligibility" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const names = [_][]const u8{ "photo.png", ".png", "a\\b.png", "a\"b.png", " leading.png" };
+    for (names) |name| try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "\x89PNG\r\n\x1a\nfixture" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ab.png", .data = "alternate is not an image" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "photo.png,", .data = "selected is plain text" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    for (names) |name| {
+        const encoded = try file_picker_path.encode(alloc, name, .{ .quoted = true });
+        defer alloc.free(encoded);
+        const token = splitImagePathToken(encoded).?;
+        try std.testing.expect(token.literal_payload);
+        const image = try load_inline_image_attachment(alloc, root, token);
+        defer types.freeImageAttachment(alloc, image);
+        const expected = try std.fs.path.join(alloc, &.{ root, name });
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, image.path);
+    }
+    const selected = try file_picker_path.encode(alloc, "photo.png,", .{});
+    defer alloc.free(selected);
+    try std.testing.expect(splitImagePathToken(selected) == null);
+    const unchanged = try extractInlineImageAttachments(alloc, root, selected, 1);
+    defer unchanged.deinit(alloc);
+    try std.testing.expectEqualStrings(selected, unchanged.text);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.images.len);
+    for ([_][]const u8{ "@\"photo.png\"other.png", "@\"photo.png", "@\"photo\\.png\"", "(@\"photo.png\")" }) |invalid| {
+        try std.testing.expect(splitImagePathToken(invalid) == null);
+    }
+    const legacy = splitImagePathToken("@photo.png,").?;
+    try std.testing.expect(!legacy.literal_payload);
+    try std.testing.expectEqualStrings("photo.png", legacy.path);
+    try std.testing.expectEqualStrings(",", legacy.suffix);
+}
+
 test "splitImagePathToken preserves only unquoted sentence punctuation" {
     const comma = splitImagePathToken("/tmp/photo.png,").?;
     try std.testing.expectEqualStrings("/tmp/photo.png", comma.path);
@@ -2508,7 +3078,8 @@ test "splitImagePathToken preserves only unquoted sentence punctuation" {
     try std.testing.expectEqualStrings("", mention.suffix);
 
     const quoted_mention = splitImagePathToken("@\"/tmp/quoted image.webp\"?!").?;
-    try std.testing.expectEqualStrings("\"/tmp/quoted image.webp\"", quoted_mention.path);
+    try std.testing.expectEqualStrings("/tmp/quoted image.webp", quoted_mention.path);
+    try std.testing.expect(quoted_mention.literal_payload);
     try std.testing.expectEqualStrings("?!", quoted_mention.suffix);
 
     const quoted = splitImagePathToken("\"/tmp/quoted image.webp\"?!").?;
@@ -2700,6 +3271,25 @@ test "encoded image limit uses exact padded base64 length" {
     try std.testing.expect(!fitsEncodedLimit(largest_fitting_raw_image + 1));
 }
 
+test "inline capture rejects one byte beyond encoded limit before directory effects" {
+    const alloc = std.testing.allocator;
+    const largest_fitting_raw_image = (max_encoded_image_bytes / 4) * 3;
+    const bytes = try alloc.alloc(u8, largest_fitting_raw_image + 1);
+    defer alloc.free(bytes);
+    @memset(bytes, 0);
+
+    try std.testing.expectError(
+        error.ImageTooLarge,
+        captureInlineImageBytes(
+            alloc,
+            1,
+            "image/png",
+            bytes,
+            "/path/that/does/not/exist",
+        ),
+    );
+}
+
 test "capture rejection distinguishes source size from preparation failure" {
     try std.testing.expectEqualStrings(
         image_too_large_notice,
@@ -2717,18 +3307,18 @@ test "image normalizer process requires success and preserves operational errors
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const success_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
-    try runImageNormalizerProcess(&success_argv, .{});
+    try runImageNormalizerProcess(&success_argv, .{}, image_normalization_timeout);
 
     const failure_argv = [_][]const u8{ "/bin/sh", "-c", "exit 7" };
     try std.testing.expectError(
         error.ImagePreparationFailed,
-        runImageNormalizerProcess(&failure_argv, .{}),
+        runImageNormalizerProcess(&failure_argv, .{}, image_normalization_timeout),
     );
 
     const signaled_argv = [_][]const u8{ "/bin/sh", "-c", "kill -TERM $$" };
     try std.testing.expectError(
         error.ImagePreparationFailed,
-        runImageNormalizerProcess(&signaled_argv, .{}),
+        runImageNormalizerProcess(&signaled_argv, .{}, image_normalization_timeout),
     );
 
     const sleeping_argv = [_][]const u8{ "/bin/sh", "-c", "sleep 10" };
@@ -2739,13 +3329,17 @@ test "image normalizer process requires success and preserves operational errors
                 .clock = .awake,
                 .raw = .fromMilliseconds(10),
             }),
-        }),
+        }, image_normalization_timeout),
+    );
+    try std.testing.expectError(
+        error.TimedOut,
+        runImageNormalizerProcess(&sleeping_argv, .{}, .{ .clock = .awake, .raw = .fromMilliseconds(10) }),
     );
 
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
-        runImageNormalizerProcess(&sleeping_argv, .{ .cancel_flag = &cancelled }),
+        runImageNormalizerProcess(&sleeping_argv, .{ .cancel_flag = &cancelled }, image_normalization_timeout),
     );
 }
 
@@ -2965,6 +3559,470 @@ test "capture normalizes an oversized encoded image on macOS or rejects locally"
         (try std.Io.Dir.cwd().statFile(std.testing.io, image_path, .{})).size,
     );
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "requests leave out attachments over the model pixel limit and name their saved file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wide = image_data.testJpeg(3420, 2224);
+    const small = image_data.testPngHeader(10, 10);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = &wide });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-2-0000000000000002.bin", .data = &small });
+    const wide_path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
+    const small_path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-2-0000000000000002.bin");
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("photo.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = wide_path },
+        .{ .id = 2, .path = @constCast("icon.png"), .media_type = @constCast("image/png"), .snapshot_path = small_path },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "compare [Image #1] and [Image #2]", .images = &images },
+        .{ .role = .assistant, .content = "ok" },
+    };
+    var cache: AttachmentDimensionCache = .empty;
+
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+    const projected = projection.messages;
+
+    try std.testing.expectEqual(@as(usize, 1), projected[0].images.len);
+    try std.testing.expectEqual(@as(usize, 2), projected[0].images[0].id);
+    const expected = try std.fmt.allocPrint(
+        arena,
+        "[Image #1 not sent: image/jpeg is 3420x2224 pixels, over the 2000-pixel limit per side. It is saved at {s}. Save a copy at most 2000 pixels per side to a new file ending in .jpg without changing this one, then read the copy.]\ncompare [Image #1] and [Image #2]",
+        .{wide_path},
+    );
+    try std.testing.expectEqualStrings(expected, projected[0].content.?);
+    try std.testing.expectEqualStrings("ok", projected[1].content.?);
+    try std.testing.expectEqual(@as(usize, 2), messages[0].images.len);
+    try std.testing.expectEqualStrings("compare [Image #1] and [Image #2]", messages[0].content.?);
+    try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
+}
+
+test "requests read each attachment snapshot once per cache" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wide = image_data.testJpeg(3420, 2224);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = &wide });
+    const wide_path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("photo.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = wide_path, .snapshot_sha256 = @constCast("a" ** 64) },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "[Image #1]", .images = &images },
+        .{ .role = .assistant, .content = "ok" },
+        .{ .role = .user, .content = "and now?" },
+    };
+    var cache: AttachmentDimensionCache = .empty;
+
+    const first = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+    try tmp.dir.deleteFile(std.testing.io, "image-1-0000000000000001.bin");
+    const second = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+
+    try std.testing.expectEqual(@as(usize, 0), first.messages[0].images.len);
+    try std.testing.expectEqual(@as(usize, 0), second.messages[0].images.len);
+    try std.testing.expectEqualStrings(first.messages[0].content.?, second.messages[0].content.?);
+    try std.testing.expectEqualSlices(usize, &.{1}, second.withheld_ids);
+}
+
+test "requests ask for a smaller copy of an oversized in-memory attachment" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var wide = image_data.testJpeg(2400, 10);
+    const images = [_]types.ImageAttachment{
+        .{ .id = 3, .path = @constCast("inline://image-3"), .media_type = @constCast("image/jpeg"), .inline_data = &wide },
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #3]", .images = &images }};
+    var cache: AttachmentDimensionCache = .empty;
+
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+
+    try std.testing.expectEqual(@as(usize, 0), projection.messages[0].images.len);
+    try std.testing.expectEqualStrings(
+        "[Image #3 not sent: image/jpeg is 2400x10 pixels, over the 2000-pixel limit per side. Ask for a copy at most 2000 pixels per side.]\n[Image #3]",
+        projection.messages[0].content.?,
+    );
+}
+
+test "requests keep attachments within the pixel limit unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var edge = image_data.testPngHeader(image_data.max_image_dimension, image_data.max_image_dimension);
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("inline://image-1"), .media_type = @constCast("image/png"), .inline_data = &edge },
+        .{ .id = 2, .path = @constCast("missing.png"), .media_type = @constCast("image/png"), .snapshot_path = @constCast("/nonexistent/image-2.bin") },
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #1] [Image #2]", .images = &images }};
+    var cache: AttachmentDimensionCache = .empty;
+
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+
+    try std.testing.expectEqual(@as([*]const types.ChatMessage, &messages), projection.messages.ptr);
+    try std.testing.expectEqual(@as(usize, 0), projection.withheld_ids.len);
+}
+
+fn testCaptureFile(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, bytes: []const u8, media_type: []const u8) !types.ImageAttachment {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+    errdefer alloc.free(path);
+    return .{ .id = 1, .path = path, .media_type = try alloc.dupe(u8, media_type) };
+}
+
+test "capture keeps or converts an oversized PNG it cannot decode and leaves one snapshot" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Wider than the in-process decoder accepts, so capture falls back.
+    const png = try png_downscale.testSolidGrayPng(alloc, 16385, 40, 128);
+    defer alloc.free(png);
+    var attachment = try testCaptureFile(alloc, &tmp, "wide.png", png, "image/png");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    if (comptime builtin.os.tag == .macos) {
+        try std.testing.expectEqualStrings("image/jpeg", attachment.media_type);
+        try std.testing.expect(!image_data.imageDimensions(verified.bytes).?.exceedsModelLimit());
+    } else {
+        try std.testing.expectEqualStrings("image/png", attachment.media_type);
+        try std.testing.expectEqualSlices(u8, png, verified.bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture downscales a PNG over both the byte and pixel limits on every platform" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(png);
+    const padded = try png_downscale.testPaddedPng(alloc, png, max_encoded_image_bytes);
+    defer alloc.free(padded);
+    try std.testing.expect(!fitsEncodedLimit(padded.len));
+    var attachment = try testCaptureFile(alloc, &tmp, "padded.png", padded, "image/png");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(verified.bytes),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture never rejects an image that is only over the pixel limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Too wide for the in-process decoder and too thin for some platform
+    // resizers, so capture may keep the source unchanged.
+    const png = try png_downscale.testSolidGrayPng(alloc, 16385, 2, 128);
+    defer alloc.free(png);
+    var attachment = try testCaptureFile(alloc, &tmp, "thin.png", png, "image/png");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    const kept = std.mem.eql(u8, png, verified.bytes);
+    try std.testing.expect(kept or !image_data.imageDimensions(verified.bytes).?.exceedsModelLimit());
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+/// Platform resizers that fail, stop at their own time limit, write output
+/// that is not an image, or write output still over the pixel limit.
+const failing_test_resizers = [_]TestResizer{
+    .{ .script = "exit 1" },
+    .{ .script = "sleep 5", .timeout = .{ .clock = .awake, .raw = .fromMilliseconds(50) } },
+    .{ .script = "printf unusable > \"$2\"" },
+    .{ .script = "cp \"$1\" \"$2\"" },
+};
+
+test "capture keeps an image only over the pixel limit when the platform resizer fails" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    const jpeg = image_data.testJpeg(3420, 2224);
+    for (failing_test_resizers) |resizer| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", &jpeg, "image/jpeg");
+        defer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+
+        try captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = resizer });
+
+        var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+        defer verified.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, &jpeg, verified.bytes);
+        try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+    }
+}
+
+test "capture rejects an image over the byte limit when the platform resizer fails" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    const frame = image_data.testJpeg(3420, 2224);
+    const jpeg = try alloc.alloc(u8, (max_encoded_image_bytes / 4) * 3 + 1);
+    defer alloc.free(jpeg);
+    @memset(jpeg, 0);
+    @memcpy(jpeg[0..frame.len], &frame);
+    for (failing_test_resizers) |resizer| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var attachment = try testCaptureFile(alloc, &tmp, "large.jpg", jpeg, "image/jpeg");
+        defer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+
+        try std.testing.expectError(
+            error.ImagePreparationFailed,
+            captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = resizer }),
+        );
+        try std.testing.expect(attachment.snapshot_path == null);
+        try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    }
+}
+
+test "capture fails when its deadline passes while the platform resizer runs" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    const frame = image_data.testJpeg(3420, 2224);
+    // A resizer failure rejects a source over the byte limit with a
+    // different error, so this source shows the deadline is what is reported.
+    const large = try alloc.alloc(u8, (max_encoded_image_bytes / 4) * 3 + 1);
+    defer alloc.free(large);
+    @memset(large, 0);
+    @memcpy(large[0..frame.len], &frame);
+    for ([_][]const u8{ &frame, large }) |jpeg| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", jpeg, "image/jpeg");
+        defer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+
+        try std.testing.expectError(
+            error.TimedOut,
+            captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{
+                .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                    .clock = .awake,
+                    .raw = .fromMilliseconds(500),
+                }),
+                .test_resizer = .{ .script = "sleep 5" },
+            }),
+        );
+        try std.testing.expect(attachment.snapshot_path == null);
+        try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    }
+}
+
+test "capture stops a platform resizer that runs past its time limit" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    // The resizer records its process id, then leaves a marker after the
+    // time limit, as a stuck resizer that recovers late would.
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "echo $$ > '{s}/resizer.pid'; sleep 1; printf late > '{s}/late.marker'",
+        .{ root, root },
+    );
+    defer alloc.free(script);
+    const jpeg = image_data.testJpeg(3420, 2224);
+    var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", &jpeg, "image/jpeg");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    try captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = .{
+        .script = script,
+        .timeout = .{ .clock = .awake, .raw = .fromMilliseconds(300) },
+    } });
+
+    const pid_text = try tmp.dir.readFileAlloc(std.testing.io, "resizer.pid", alloc, .limited(32));
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trimEnd(u8, pid_text, "\n"), 10);
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    // Waiting for the resizer to finish on its own would leave the marker
+    // before capture returns; a resizer left running would leave it later.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "late.marker", .{}));
+    try std.testing.io.sleep(.fromMilliseconds(1500), .awake);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "late.marker", .{}));
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture keeps the source when its downscaled copy is over the byte limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = try png_downscale.testRandomPalettePng(alloc, 2001, 1300);
+    defer alloc.free(png);
+    var attachment = try testCaptureFile(alloc, &tmp, "scattered.png", png, "image/png");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    // A failing platform resizer leaves macOS with the same outcome as
+    // platforms without one.
+    try captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = .{ .script = "exit 1" } });
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, png, verified.bytes);
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "in-memory capture keeps the original when its downscaled copy is over the byte limit" {
+    const alloc = std.testing.allocator;
+    const png = try png_downscale.testRandomPalettePng(alloc, 2001, 1300);
+    defer alloc.free(png);
+    try std.testing.expect(fitsEncodedLimit(png.len));
+    const smaller = (try png_downscale.downscaleOversized(alloc, "image/png", png)).?;
+    defer alloc.free(smaller.png);
+    try std.testing.expect(!fitsEncodedLimit(smaller.png.len));
+
+    const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+    try std.testing.expectEqualSlices(u8, png, attachment.inline_data.?);
+}
+
+test "inline capture downscales an oversized PNG over the byte limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    const wide = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(wide);
+    const padded_wide = try png_downscale.testPaddedPng(alloc, wide, max_encoded_image_bytes);
+    defer alloc.free(padded_wide);
+
+    const attachment = try captureInlineImageBytes(alloc, 1, "image/png", padded_wide, snapshot_dir);
+    defer types.freeImageAttachment(alloc, attachment);
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(verified.bytes),
+    );
+
+    // Within the pixel limit, downscaling cannot shrink the bytes.
+    const small = try png_downscale.testSolidGrayPng(alloc, 64, 8, 128);
+    defer alloc.free(small);
+    const padded_small = try png_downscale.testPaddedPng(alloc, small, max_encoded_image_bytes);
+    defer alloc.free(padded_small);
+    try std.testing.expectError(error.ImageTooLarge, captureInlineImageBytes(alloc, 2, "image/png", padded_small, snapshot_dir));
+}
+
+test "requests find a JPEG frame header behind large metadata" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const jpeg = try image_data.testJpegBehindMetadata(arena, 4032, 3024);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = jpeg });
+    const path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("portrait.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = path },
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #1]", .images = &images }};
+    var cache: AttachmentDimensionCache = .empty;
+
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+
+    try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
+    try std.testing.expect(std.mem.startsWith(u8, projection.messages[0].content.?, "[Image #1 not sent: image/jpeg is 4032x3024 pixels"));
+}
+
+test "in-memory capture downscales an oversized PNG and keeps other formats" {
+    const alloc = std.testing.allocator;
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(png);
+    const shrunk = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, shrunk);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(shrunk.inline_data.?),
+    );
+    var verified = try loadVerifiedSnapshot(alloc, shrunk, .{});
+    verified.deinit(alloc);
+
+    const jpeg = image_data.testJpeg(3420, 2224);
+    const kept = try captureInlineImageBytesInMemory(alloc, 2, "image/jpeg", &jpeg);
+    defer types.freeImageAttachment(alloc, kept);
+    try std.testing.expectEqualSlices(u8, &jpeg, kept.inline_data.?);
+}
+
+test "capture downscales a PNG over the model pixel limit on every platform" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(png);
+    try std.testing.expect(fitsEncodedLimit(png.len));
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "wide.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, png);
+    }
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "wide.png");
+    defer alloc.free(image_path);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    var attachment = types.ImageAttachment{
+        .id = 1,
+        .path = try alloc.dupe(u8, image_path),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    };
+    defer types.freeImageAttachment(alloc, attachment);
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(verified.bytes),
+    );
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "inline capture rejects a declared type that contradicts the bytes before directory effects" {
+    try std.testing.expectError(
+        error.ImageSnapshotMediaTypeMismatch,
+        captureInlineImageBytes(
+            std.testing.allocator,
+            1,
+            "image/jpeg",
+            "\x89PNG\r\n\x1a\nnot-a-jpeg",
+            "/path/that/does/not/exist",
+        ),
+    );
 }
 
 test "capture rejects invalid normalization output without snapshot residue" {
@@ -3779,4 +4837,63 @@ test "review image replay observes cancellation between base64 chunks" {
     ));
     try std.testing.expect(writer.total_written > 3 * 1024);
     try std.testing.expect(writer.total_written < 16 * 1024);
+}
+
+test "in-memory inline capture validates and retains image bytes without a filesystem" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+    const attachment = try captureInlineImageBytesInMemory(alloc, 3, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    try std.testing.expectEqual(@as(usize, 3), attachment.id);
+    try std.testing.expectEqualStrings("image/png", attachment.media_type);
+    try std.testing.expectEqualStrings("inline://image-3", attachment.path);
+    try std.testing.expectEqual(@as(?[]const u8, null), attachment.snapshot_path);
+    try std.testing.expectEqualStrings(png, attachment.inline_data.?);
+    try std.testing.expectEqual(@as(usize, snapshot_digest_hex_len), attachment.snapshot_sha256.?.len);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualStrings(png, verified.bytes);
+    try std.testing.expectEqualStrings("image/png", verified.media_type);
+}
+
+test "in-memory inline capture rejects invalid input before retaining bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+
+    try std.testing.expectError(error.InvalidImageId, captureInlineImageBytesInMemory(alloc, 0, "image/png", png));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "image/png", ""));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "", png));
+    try std.testing.expectError(error.UnsupportedImageType, captureInlineImageBytesInMemory(alloc, 1, "image/png", "not an image"));
+    try std.testing.expectError(
+        error.ImageSnapshotMediaTypeMismatch,
+        captureInlineImageBytesInMemory(alloc, 1, "image/jpeg", png),
+    );
+    const oversized = try alloc.alloc(u8, max_image_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    @memcpy(oversized[0..8], "\x89PNG\r\n\x1a\n");
+    try std.testing.expectError(error.ImageTooLarge, captureInlineImageBytesInMemory(alloc, 1, "image/png", oversized));
+}
+
+test "inline snapshot verification rejects corrupted retained bytes" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\ninline-payload";
+    const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+
+    var corrupted = attachment;
+    corrupted.inline_data = try alloc.dupe(u8, attachment.inline_data.?);
+    defer alloc.free(corrupted.inline_data.?);
+    corrupted.inline_data.?[9] ^= 1;
+    try std.testing.expectError(error.ImageSnapshotCorrupt, loadVerifiedSnapshot(alloc, corrupted, .{}));
+
+    var wrong_type = attachment;
+    wrong_type.media_type = @constCast("image/jpeg");
+    try std.testing.expectError(error.ImageSnapshotMediaTypeMismatch, loadVerifiedSnapshot(alloc, wrong_type, .{}));
+
+    var missing_digest = attachment;
+    missing_digest.snapshot_sha256 = null;
+    try std.testing.expectError(error.MissingImageSnapshot, loadVerifiedSnapshot(alloc, missing_digest, .{}));
 }

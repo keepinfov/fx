@@ -17,6 +17,9 @@ pub const ManagedChildKind = enum {
     subagent_control,
     terminal_state,
     terminal_proofs,
+    /// Session-scoped context supplied by the client that created it, such as
+    /// an ACP client system prompt.
+    client_context,
 };
 
 pub const Mode = enum {
@@ -187,6 +190,7 @@ const CapabilityImpl = struct {
     terminal_parent: ?io_mod.VerifiedDir = null,
     terminal_state: ?io_mod.VerifiedDir = null,
     terminal_proofs: ?io_mod.VerifiedDir = null,
+    client_context: ?io_mod.VerifiedDir = null,
     indeterminate_names: [@typeInfo(ManagedChildKind).@"enum".fields.len]?[]u8 =
         [_]?[]u8{null} ** @typeInfo(ManagedChildKind).@"enum".fields.len,
 
@@ -202,6 +206,7 @@ const CapabilityImpl = struct {
         closeOptionalDir(&self.terminal_state);
         closeOptionalDir(&self.terminal_proofs);
         closeOptionalDir(&self.terminal_parent);
+        closeOptionalDir(&self.client_context);
         self.session_dir.close();
         self.alloc.free(self.display_session_path);
         if (self.legacy_display_route) |path| self.alloc.free(path);
@@ -292,6 +297,12 @@ const CapabilityImpl = struct {
                 "subagent",
                 create_if_missing,
             ),
+            .client_context => self.ensureComponent(
+                &self.session_dir,
+                &self.client_context,
+                "client",
+                create_if_missing,
+            ),
             .terminal_state, .terminal_proofs => blk: {
                 const parent = try self.ensureComponent(
                     &self.session_dir,
@@ -331,6 +342,7 @@ const CapabilityImpl = struct {
             .subagent_control => &self.subagent_control.?,
             .terminal_state => &self.terminal_state.?,
             .terminal_proofs => &self.terminal_proofs.?,
+            .client_context => &self.client_context.?,
         };
     }
 
@@ -457,6 +469,10 @@ const CapabilityImpl = struct {
                 alloc,
                 &.{ self.display_session_path, "terminal", "proofs" },
             ),
+            .client_context => std.fs.path.join(
+                alloc,
+                &.{ self.display_session_path, "client" },
+            ),
         };
     }
 
@@ -502,6 +518,19 @@ const CapabilityImpl = struct {
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
 
+    pub fn duplicate(
+        self: *const SessionChildCapability,
+        alloc: Allocator,
+    ) !SessionChildCapability {
+        return initWithOptions(
+            alloc,
+            self.impl.session_dir.dir,
+            self.impl.display_session_path,
+            self.impl.mode,
+            .{},
+        );
+    }
+
     pub fn init(
         alloc: Allocator,
         session_dir: std.Io.Dir,
@@ -538,6 +567,37 @@ pub const SessionChildCapability = struct {
             route.setPermissions(io_mod.getIo(), private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
+        return initOpenedLegacyRoute(alloc, route, route_path, kind, mode);
+    }
+
+    /// Reads only an existing control route; legacy session parents need not
+    /// have acquired current-format directory permissions before discovery.
+    pub fn initLegacySubagentControl(
+        alloc: Allocator,
+        session_dir: std.Io.Dir,
+        display_session_path: []const u8,
+    ) !?SessionChildCapability {
+        var route = session_dir.openDir(io_mod.getIo(), "subagent", .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return err,
+        };
+        errdefer route.close(io_mod.getIo());
+        const display = try std.fs.path.join(alloc, &.{ display_session_path, "subagent" });
+        defer alloc.free(display);
+        return try initOpenedLegacyRoute(alloc, route, display, .subagent_control, .read_only);
+    }
+
+    fn initOpenedLegacyRoute(
+        alloc: Allocator,
+        route: std.Io.Dir,
+        route_path: []const u8,
+        kind: ManagedChildKind,
+        mode: Mode,
+    ) !SessionChildCapability {
         try verifyPrivateDirectory(route);
 
         var retained = try route.openDir(io_mod.getIo(), ".", .{
@@ -569,6 +629,7 @@ pub const SessionChildCapability = struct {
             .subagent_control => impl.subagent_control = .{ .dir = route },
             .terminal_state => impl.terminal_state = .{ .dir = route },
             .terminal_proofs => impl.terminal_proofs = .{ .dir = route },
+            .client_context => impl.client_context = .{ .dir = route },
         }
         return .{ .impl = impl };
     }
@@ -788,6 +849,26 @@ pub const SessionChildCapability = struct {
         self.* = undefined;
     }
 
+    pub fn cloneReadOnly(
+        self: *const SessionChildCapability,
+        alloc: Allocator,
+    ) !SessionChildCapability {
+        if (self.impl.legacy_direct_kind != null or
+            self.impl.legacy_background_root)
+        {
+            return error.SessionChildStoreFailed;
+        }
+        var cloned = try initWithOptions(
+            alloc,
+            self.impl.session_dir.dir,
+            self.impl.display_session_path,
+            .read_only,
+            .{},
+        );
+        cloned.impl.allowed_kind = self.impl.allowed_kind;
+        return cloned;
+    }
+
     pub fn createExclusiveFile(
         self: *SessionChildCapability,
         alloc: Allocator,
@@ -961,7 +1042,9 @@ pub const SessionChildCapability = struct {
                 else => return err,
             };
             try verifyPrivateStat(file_stat);
-            try names.append(alloc, try alloc.dupe(u8, entry.name));
+            const owned_name = try alloc.dupe(u8, entry.name);
+            errdefer alloc.free(owned_name);
+            try names.append(alloc, owned_name);
         }
         return .{
             .alloc = alloc,
@@ -1413,6 +1496,53 @@ test "managed child capability rejects invalid names and unsafe routes" {
     try std.testing.expectError(
         error.SessionPathUnsafe,
         capability.iterate(alloc, .browser_artifacts),
+    );
+}
+
+test "read-only capability clone owns independent retained routes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try openTestSession(alloc, &tmp);
+    defer session.dir.close(io_mod.getIo());
+    defer alloc.free(session.display_path);
+    var original = try SessionChildCapability.initForTesting(
+        alloc,
+        session.dir,
+        session.display_path,
+        .writable,
+        .{},
+    );
+    var original_open = true;
+    defer if (original_open) original.deinit();
+
+    var file = try original.createExclusiveFile(
+        alloc,
+        .tool_results,
+        "result.txt",
+    );
+    try file.writeAll("retained result");
+    try file.sync();
+    file.deinit();
+
+    var cloned = try original.cloneReadOnly(alloc);
+    defer cloned.deinit();
+    original.deinit();
+    original_open = false;
+
+    var retained = try cloned.openFileReadOnly(
+        alloc,
+        .tool_results,
+        "result.txt",
+    );
+    defer retained.deinit();
+    const bytes = try retained.readToEnd(alloc, 64);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("retained result", bytes);
+    try std.testing.expectError(
+        error.SessionChildReadOnly,
+        cloned.createExclusiveFile(alloc, .tool_results, "blocked.txt"),
     );
 }
 

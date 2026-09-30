@@ -62,7 +62,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/terminal/tmux_session.zig", "runLauncher", /fixed_descriptor/, "subprocess_protocol_transport", "private tmux launcher PTY descriptor"),
   rule("src/core/terminal/client.zig", "(?:runFixture|writeFixtureJson)", /stdio_acquisition_write/, "tests", "private terminal client fixture output"),
   rule("src/terminal_client_fixture.zig", "(?:writeCompletionJson|writeJson)", /stdio_acquisition_write/, "tests", "private test-fixture output"),
-  rule("src/core/shared/darwin_process_spawn.zig", "process_spawn", /fixed_descriptor/, "subprocess_protocol_transport", "child stdio file-action mapping"),
+  rule("src/core/shared/darwin_process_spawn.zig", "process_spawn_inheriting_fd", /fixed_descriptor/, "subprocess_protocol_transport", "child stdio and witness file-action mapping"),
   rule("src/core/app/app_entry_runtime.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "post-terminal handoff or failure output"),
   rule("src/core/app/app_upgrade_runtime.zig", "writeStderrDefault", /stdio_acquisition_write/, "noninteractive_output", "post-terminal upgrade relaunch failure output"),
   rule("src/core/upgrade/upgrade_runtime.zig", "progressWait", /stdio_(?:acquisition|write)/, "noninteractive_output", "upgrade progress output"),
@@ -76,6 +76,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/auth/login_flow.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "CLI auth login output"),
   rule("src/core/auth/chatgpt_oauth.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "Codex CLI login output"),
   rule("src/core/auth/grok_oauth.zig", "writeStdout", /stdio_acquisition_write/, "noninteractive_output", "Grok CLI login output"),
+  rule("src/core/slack/install.zig", "run", /stdio_acquisition_write/, "noninteractive_output", "Slack CLI installation authorization prompt"),
   rule("src/core/shared/debug_trace.zig", "(?:writeLine|writeNoninteractiveStderr)", /debug_print/, "noninteractive_output", "opt-in tracing"),
   rule("tests/json-schema/corpus_runner.zig", "printLine", /stdio_acquisition/, "noninteractive_output", "JSON Schema corpus report output"),
   rule("src/main.zig", "(?:writeStdoutFast|writeStderrFast)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write)/, "noninteractive_output", "top-level help and CLI validation output"),
@@ -83,6 +84,7 @@ const allowlist: AllowRule[] = [
   rule("src/main.zig", "runExternalInteractive", /stdio_acquisition_write/, "initialization_teardown", "external CLI handoff spacing"),
   rule("benchmarks/activity_progress.zig", "main", /stdio_acquisition/, "benchmark_output", "benchmark report output"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/core/app/app_render_runtime.zig", "checkRewritePublicationRetry", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_worker_runtime.zig", "(?:printModelTrace|printLifecycleDrainTrace)", /debug_print/, "tests", "test diagnostics"),
 ];
 

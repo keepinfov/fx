@@ -19,7 +19,7 @@ pub const Callback = *const fn (
 ) anyerror!void;
 
 /// Maximum bytes added around unchanged stdout/stderr bodies by
-/// `formatForegroundCommandResult`.
+/// `formatCommandResult`.
 pub const max_foreground_result_envelope_bytes: usize =
     "exit_code=-9223372036854775808\n".len +
     "<stdout>\n".len + "\n</stdout>\n".len +
@@ -641,7 +641,7 @@ test "foreground result extraction is exact and rejects delimiter collisions" {
     )) == null);
     try std.testing.expect((try canonicalizeForegroundResult(
         alloc,
-        "timeout=true\ncommand timed out and was terminated\n",
+        "timeout=true\ncleanup_guarantee=best_effort\n",
     )) == null);
 }
 

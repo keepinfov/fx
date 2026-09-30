@@ -22,6 +22,7 @@ import { FX_BIN } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeShellRun,
   fakeGatewayToolCall,
   startFakeGateway,
   TmuxSession,
@@ -459,10 +460,11 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeGatewayToolCall("observer_thinking_running", "terminal", {
-            action: "exec",
-            command: "sleep 5 # this command is intentionally verbose so the running status must end with an omission marker at the terminal boundary",
-          });
+          return fakeShellRun(
+            "observer_thinking_running",
+            "sleep 5 # this command is intentionally verbose so the running status must end with an omission marker at the terminal boundary",
+            { timeout_ms: 600_000 },
+          );
         },
         async () => {
           await finish.promise;
@@ -484,10 +486,11 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeGatewayToolCall("observer_thinking_final", "terminal", {
-            action: "exec",
-            command: "printf OBSERVER_THINKING_TOOL_FINAL # this command is intentionally verbose so the completed status must wrap and truncate at the terminal boundary",
-          });
+          return fakeShellRun(
+            "observer_thinking_final",
+            "printf OBSERVER_THINKING_TOOL_FINAL # this command is intentionally verbose so the completed status must wrap and truncate at the terminal boundary",
+            { timeout_ms: 600_000 },
+          );
         },
         () => fakeGatewayFinalText("OBSERVER_THINKING_FINAL_RESPONSE"),
       ]);
@@ -509,10 +512,11 @@ async function setupScenario(
       gateway = startFakeGateway([
         async () => {
           await gate.promise;
-          return fakeGatewayToolCall("observer_thinking_failed", "terminal", {
-            action: "exec",
-            command: "sh -c 'printf OBSERVER_THINKING_TOOL_FAILED >&2; exit 17' # this command is intentionally verbose so the failed status must wrap and truncate at the terminal boundary",
-          });
+          return fakeShellRun(
+            "observer_thinking_failed",
+            "sh -c 'printf OBSERVER_THINKING_TOOL_FAILED >&2; exit 17' # this command is intentionally verbose so the failed status must wrap and truncate at the terminal boundary",
+            { timeout_ms: 600_000 },
+          );
         },
         () => fakeGatewayFinalText("OBSERVER_THINKING_FAILED_RESPONSE"),
       ]);

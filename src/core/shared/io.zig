@@ -207,9 +207,10 @@ fn openExistingRegularFileWithPolicy(
     const initial = try dir.statFile(getIo(), sub_path, .{
         .follow_symlinks = policy.final_symlink == .follow,
     });
-    if (initial.kind != .file or (policy.hardlinks == .reject and initial.nlink != 1)) {
-        return error.DurablePathUnsafe;
-    }
+    // A lookup that races an atomic replacement can return the replaced file
+    // after its last link is gone. Apply the opened-file policy, so a
+    // read-only open accepts that snapshot as the check after the open does.
+    try verifyOpenedRegularFileWithPolicy(initial, policy);
 
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         var file = try dir.openFile(getIo(), sub_path, .{
@@ -329,6 +330,37 @@ test "read-only regular files remain valid when atomic replacement unlinks the d
     try std.testing.expectEqualStrings("old", bytes);
 }
 
+test "read-only opens accept a file that a concurrent atomic replacement unlinks" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(getIo(), .{ .sub_path = "target", .data = "v" });
+    const Replacer = struct {
+        dir: std.Io.Dir,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                self.dir.writeFile(getIo(), .{ .sub_path = "next", .data = "v" }) catch return;
+                self.dir.rename("next", self.dir, "target", getIo()) catch return;
+            }
+        }
+    };
+    var replacer: Replacer = .{ .dir = tmp.dir };
+    const thread = try std.Thread.spawn(.{}, Replacer.run, .{&replacer});
+    defer {
+        replacer.stop.store(true, .release);
+        thread.join();
+    }
+    // Some lookups see the replaced file after its last link is gone.
+    for (0..5000) |_| {
+        var file = try openExistingRegularFile(tmp.dir, "target", .read_only);
+        file.close(getIo());
+    }
+}
+
 test "read-only regular file policy accepts hardlinks while durable policy rejects" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -395,6 +427,29 @@ pub fn e2eFailIfDurableMutationAttempted() void {
 
 pub fn environMap() ?*const std.process.Environ.Map {
     return global_environ;
+}
+
+pub const CloneEnvironMapError = std.mem.Allocator.Error ||
+    std.process.Environ.CreateMapError ||
+    error{EnvironmentUnavailable};
+
+pub fn cloneEnvironMap(
+    alloc: std.mem.Allocator,
+) CloneEnvironMapError!std.process.Environ.Map {
+    if (global_environ) |map| return map.clone(alloc);
+    if (global_environ_block) |block| {
+        return std.process.Environ.createMap(.{ .block = block }, alloc);
+    }
+    if (global_raw_environ) |raw| {
+        var len: usize = 0;
+        while (raw[len] != null) : (len += 1) {}
+        const entries: []const [*:0]const u8 = @ptrCast(raw[0..len]);
+        var map = std.process.Environ.Map.init(alloc);
+        errdefer map.deinit();
+        try map.putPosixBlock(.{ .slice = entries });
+        return map;
+    }
+    return error.EnvironmentUnavailable;
 }
 
 fn getenvFromBlock(block: std.process.Environ.Block, key: []const u8) ?[]const u8 {
@@ -880,9 +935,22 @@ pub fn makeDirRecursive(path: []const u8) !void {
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&buf, "{s}", .{path});
+    const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.NameTooLong;
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const ptr = std.c.realpath(path_z, &result_buf) orelse return error.FileNotFound;
+    const ptr = std.c.realpath(path_z, &result_buf) orelse {
+        return switch (std.posix.errno(-1)) {
+            .NOENT => error.FileNotFound,
+            .NOTDIR => error.NotDir,
+            .LOOP => error.SymLinkLoop,
+            .ACCES => error.AccessDenied,
+            .PERM => error.PermissionDenied,
+            .NAMETOOLONG => error.NameTooLong,
+            .INVAL => error.BadPathName,
+            .IO => error.InputOutput,
+            .NOMEM => error.OutOfMemory,
+            else => |err| std.posix.unexpectedErrno(err),
+        };
+    };
     const resolved = std.mem.sliceTo(ptr, 0);
     return alloc.dupe(u8, resolved);
 }
@@ -997,6 +1065,71 @@ test "environMap returns borrowed process environment map" {
     const borrowed = environMap().?;
     try std.testing.expectEqualStrings("present", borrowed.get("FX_CORE2_IO_TEST").?);
     global_environ = null;
+}
+
+test "cloneEnvironMap owns an independent copy of map environment state" {
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+    }
+
+    var source = std.process.Environ.Map.init(std.testing.allocator);
+    defer source.deinit();
+    try source.put("PATH", "/map/bin");
+    setEnvironMap(&source);
+
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try source.put("PATH", "/changed");
+    try std.testing.expectEqualStrings("/map/bin", cloned.get("PATH").?);
+}
+
+test "cloneEnvironMap copies installed block environment state" {
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+    }
+
+    var source = std.process.Environ.Map.init(std.testing.allocator);
+    defer source.deinit();
+    try source.put("HOME", "/block/home");
+    const block = try source.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    setEnvironBlock(block);
+
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqualStrings("/block/home", cloned.get("HOME").?);
+}
+
+test "cloneEnvironMap copies installed raw environment state" {
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+    }
+
+    const raw_entries = [_:null]?[*:0]const u8{
+        "PATH=/raw/bin",
+        "HOME=/raw/home",
+    };
+    setRawEnviron(@ptrCast(&raw_entries));
+
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqualStrings("/raw/bin", cloned.get("PATH").?);
+    try std.testing.expectEqualStrings("/raw/home", cloned.get("HOME").?);
 }
 
 test "readFileToEnd: file under cap returns full content" {
@@ -1184,6 +1317,23 @@ test "realpathAlloc on nonexistent path returns FileNotFound" {
     defer alloc.free(missing);
 
     try std.testing.expectError(error.FileNotFound, realpathAlloc(alloc, missing));
+}
+
+test "realpathAlloc distinguishes non-directory and symlink-loop paths" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(tmp.dir, "file", "content");
+    try tmp.dir.symLink(getIo(), "loop", "loop", .{});
+    const root = try dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const not_dir = try std.fs.path.join(alloc, &.{ root, "file/child" });
+    defer alloc.free(not_dir);
+    const loop = try std.fs.path.join(alloc, &.{ root, "loop/child" });
+    defer alloc.free(loop);
+
+    try std.testing.expectError(error.NotDir, realpathAlloc(alloc, not_dir));
+    try std.testing.expectError(error.SymLinkLoop, realpathAlloc(alloc, loop));
 }
 
 const DurableFailureState = struct {

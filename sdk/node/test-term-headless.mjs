@@ -31,11 +31,11 @@ const mockFetch = async (_url, init) => {
   return new Response(new ReadableStream({
     async start(controller) {
       firstChunkAt = performance.now();
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"streamed"}\n'));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"streamed"}\n\n'));
       await new Promise((resolve) => setTimeout(resolve, 20));
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" response"}\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n"));
+      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":" response"}\n\n'));
+      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
       controller.close();
     },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -96,8 +96,8 @@ const exitCode = await Promise.race([
 ]);
 
 if (exitCode !== 0) throw new Error(`fx-term exited with code ${exitCode}`);
-if (!grid.includes("𝒇x")) throw new Error(`shared Fx welcome frame was not visible in xterm grid:\n${grid}`);
-if (!grid.includes("Run /help for commands")) throw new Error(`shared Fx welcome guidance was not visible in xterm grid:\n${grid}`);
+if (!grid.includes("𝒇x")) throw new Error(`shared fx welcome frame was not visible in xterm grid:\n${grid}`);
+if (!grid.includes("Run /help for commands")) throw new Error(`shared fx welcome guidance was not visible in xterm grid:\n${grid}`);
 if (terminal.buffer.active.baseY !== 0 || terminal.buffer.active.viewportY !== 0) {
   throw new Error(`fresh xterm startup created blank scrollback: baseY=${terminal.buffer.active.baseY}, viewportY=${terminal.buffer.active.viewportY}`);
 }
@@ -110,4 +110,4 @@ if (!grid.includes("streamed response")) throw new Error(`terminal prompt did no
 if (requestedModel !== "sdk/accepted-model") throw new Error(`terminal prompt used unexpected accepted model: ${requestedModel}`);
 if (!(firstChunkAt >= startedAt)) throw new Error("terminal fetch did not produce a first stream chunk");
 
-console.log("headless xterm smoke passed: shared Fx frame used the 96x30 host cell grid");
+console.log("headless xterm smoke passed: shared fx frame used the 96x30 host cell grid");
