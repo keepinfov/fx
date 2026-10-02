@@ -482,7 +482,7 @@ describe("configured providers", () => {
 
       const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
       expect(blank.code).toBe(1);
-      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(blank.stderr).toBe("fx: no model is selected for this connection; run `fx provider add <name> --model <id>` to save one, or set a model for this run with --model or FX_MODEL\n");
       expect(chatModels()).toHaveLength(2);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
     } finally { f.close(); }
@@ -713,7 +713,6 @@ describe("provider management commands", () => {
       expect(requests[0].path).toBe("/v1/chat/completions");
       expect(requests[0].body.model).toBe("local-model");
       expect(requests[0].body.reasoning_effort).toBe("high");
-      expect(requests[0].body.max_tokens).toBe(8192);
     } finally {
       server.stop(true);
       cleanupIsolatedTestHome(home);

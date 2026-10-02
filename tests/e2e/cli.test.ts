@@ -338,7 +338,7 @@ describe("cli: help", () => {
       expect(stdout).toContain("Run one noninteractive request");
       expect(stdout).toContain("Sign in to a model provider");
       expect(stdout).toContain("Sign out of a model provider");
-      expect(stdout).toContain("Choose the active model provider");
+      expect(stdout).toContain("Choose or manage model providers");
       expect(stdout).toContain("Configure a Vercel AI Gateway API key");
       expect(stdout).toContain("Choose a Vercel AI Gateway team");
       expect(stdout).toContain("Show Vercel AI Gateway credits");
