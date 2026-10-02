@@ -1570,6 +1570,15 @@ fn formatModelSafeSnapshotRaw(
 
 const shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error), so nothing executed. Rewrite the command with corrected quoting or escaping and submit the full corrected command instead of rerunning the same text.";
 const usage_error_retry_guidance = "The command exited with a usage error (missing or invalid arguments). Rebuild the command with the required arguments explicitly set, then submit the corrected command instead of rerunning it unchanged.";
+const login_shell_unavailable_retry_guidance = "The configured login shell is not installed on this machine, so nothing executed. Retry with an available shell such as bash, zsh, or sh instead of assuming the command may have changed state.";
+
+fn executionErrorRetryGuidance(error_name: ?[]const u8) ?[]const u8 {
+    const name = error_name orelse return null;
+    if (std.mem.eql(u8, name, "LoginShellUnavailable")) {
+        return login_shell_unavailable_retry_guidance;
+    }
+    return null;
+}
 
 fn failureRetryGuidance(exit_code: ?i64, output: []const u8) ?[]const u8 {
     const code = exit_code orelse return null;
@@ -1643,6 +1652,8 @@ fn formatSnapshotRaw(
         };
     const retry_guidance: ?[]const u8 = if (snapshot.output_incomplete)
         "Command output is incomplete. Inspect external state and available output before retrying; do not blindly rerun a command that may have changed state."
+    else if (executionErrorRetryGuidance(snapshot.error_name)) |guidance|
+        guidance
     else switch (snapshot.state) {
         .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
         .completed => failureRetryGuidance(projection.exit_code, snapshot.output_delta),
@@ -2287,6 +2298,33 @@ test "lost shell snapshot preserves indeterminate execution guidance" {
         object.get("retry_guidance").?.string,
         "do not blindly rerun",
     ) != null);
+}
+
+test "lost shell snapshot with unavailable login shell carries shell guidance" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-shell-unavailable"),
+        .command = @constCast("echo hello"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .lost,
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .error_name = @constCast("LoginShellUnavailable"),
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings(
+        login_shell_unavailable_retry_guidance,
+        object.get("retry_guidance").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "LoginShellUnavailable",
+        object.get("error").?.string,
+    );
 }
 
 test "completed shell snapshot reports incomplete output without losing status" {

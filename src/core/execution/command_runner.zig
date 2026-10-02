@@ -1651,6 +1651,15 @@ fn executeRawBashWithResultCommand(
     return formatCollectedOutput(alloc, result_command, cwd, result);
 }
 
+/// Rejects a resolved shell that vanished before spawn so callers report a
+/// shell-availability failure instead of a raw spawn ENOENT.
+fn requireInstalledShell(path: []const u8) !void {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.LoginShellUnavailable,
+        else => return err,
+    };
+}
+
 fn executeRawInvocation(
     alloc: Allocator,
     scratch: Allocator,
@@ -1662,6 +1671,7 @@ fn executeRawInvocation(
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.InvalidCommandEnvironment;
     }
+    try requireInstalledShell(invocation.path);
     const result = try executeProcessWithScript(
         scratch,
         cfg,
@@ -1670,6 +1680,24 @@ fn executeRawInvocation(
         "",
     );
     return formatCollectedOutput(alloc, command, cwd, result);
+}
+
+test "missing captured shell reports shell availability instead of spawn ENOENT" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectError(
+        error.LoginShellUnavailable,
+        executeCommandInEnvironment(
+            .{ .max_command_output_bytes = 1024 },
+            arena,
+            "printf unreachable",
+            "/tmp",
+            .{ .user = "/definitely/missing/bash" },
+        ),
+    );
 }
 
 test "explicit captured profiles execute exact shells without synthetic stderr" {
