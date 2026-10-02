@@ -65,12 +65,25 @@ Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, cu
 
 ## Custom model connections
 
-Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:
+Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama, gateways such as OpenRouter, and first-party APIs such as DeepSeek:
 
 ```bash
-fx provider local
+fx provider add deepseek
+fx provider add local --base-url http://localhost:11434/v1 --no-auth --model llama3 --context-window 8192
+fx provider add openrouter --base-url https://openrouter.ai/api/v1 --api-key-env OPENROUTER_API_KEY --model openai/gpt-4.1
+fx provider list
+fx provider remove deepseek
+```
+
+`add` writes the connection to `~/.fx/settings.json`, saves the selected model, and switches the profile to it. Known presets such as `deepseek` prefill the endpoint, API key environment variable, model, context window, tool support, and reasoning efforts. Pass `--save-api-key` to store the key under `~/.fx/provider-credentials/` (0600) instead of reading an environment variable, `--no-select` to define a connection without switching to it, and `--reasoning-efforts low,high,max` to advertise `reasoning_effort` values for endpoints that support them.
+
+Connections remain plain JSON and can still be hand-edited or committed. Select one for a single invocation with environment variables:
+
+```bash
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 fx ask "review this change"
 ```
+
+For DeepSeek, use `https://api.deepseek.com`; fx appends `/chat/completions`. A `base_url` that already names the `/chat/completions` endpoint is accepted unchanged.
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 

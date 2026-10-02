@@ -13,6 +13,7 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const provider_secret_store = @import("provider_secret_store.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
 
@@ -388,6 +389,7 @@ pub fn resolveForProvider(
         return switch (definition.auth) {
             .none => .{ .credential = .{ .token = try alloc.dupe(u8, ""), .source = .configured } },
             .bearer => |env| .{ .credential = try loadEnvCredential(alloc, env, .configured) },
+            .stored => .{ .credential = try loadStoredConfiguredCredential(alloc, bound.configured.binding.?) },
         };
     }
     if (provider != .gateway) {
@@ -655,6 +657,19 @@ fn loadStoredKeyCredential(
     if (secret_store.isDisabled()) return null;
     const value = (try secret_store.load(alloc)) orelse return null;
     return .{ .token = value, .source = .stored_key };
+}
+
+/// A missing stored key returns null so the provider surfaces its normal
+/// missing-credential guidance instead of sending an empty Authorization.
+fn loadStoredConfiguredCredential(
+    alloc: std.mem.Allocator,
+    binding: [32]u8,
+) !?Credential {
+    const value = provider_secret_store.load(alloc, binding) catch |err| switch (err) {
+        error.ProviderSecretStoreDisabled => return null,
+        else => return err,
+    } orelse return null;
+    return .{ .token = value, .source = .configured };
 }
 
 fn loadChatGptCredential(

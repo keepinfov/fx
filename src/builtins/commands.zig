@@ -168,8 +168,15 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <name>",
-        .summary = "Choose the model provider used by fx",
+        .usage = "provider <name>|add|list|remove",
+        .summary = "Choose, add, list, or remove model providers",
+        .details = &.{
+            "fx provider <name> selects a signed-in or configured provider.",
+            "fx provider add <name> [--base-url URL] [--api-key-env ENV | --save-api-key | --no-auth] [--model ID]",
+            "add saves an OpenAI-compatible connection; known presets such as deepseek prefill endpoint, key slot, model, and capabilities.",
+            "fx provider list [--json] lists configured connections without printing secrets.",
+            "fx provider remove <name> [--json] deletes a configured connection and its stored key.",
+        },
     },
     .{
         .kind = .doctor,
@@ -310,7 +317,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     .{ .entries = &.{
         .{ .kind = .login, .usage = "login [vercel|codex|grok]", .summary = "Sign in to a model provider" },
         .{ .kind = .logout, .usage = "logout [vercel|codex|grok]", .summary = "Sign out of a model provider" },
-        .{ .kind = .provider, .usage = "provider <name>", .summary = "Choose the active model provider" },
+        .{ .kind = .provider, .usage = "provider <name|add|list|remove>", .summary = "Choose or manage model providers" },
         .{ .kind = .models, .usage = "models" },
     } },
     .{ .entries = &.{
