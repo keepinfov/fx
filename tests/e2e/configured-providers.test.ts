@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, cleanupIsolatedTestHome, createIsolatedTestHome, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
@@ -482,7 +482,7 @@ describe("configured providers", () => {
 
       const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
       expect(blank.code).toBe(1);
-      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(blank.stderr).toBe("fx: no model is selected for this connection; run `fx provider add <name> --model <id>` to save one, or set a model for this run with --model or FX_MODEL\n");
       expect(chatModels()).toHaveLength(2);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
     } finally { f.close(); }
@@ -633,4 +633,89 @@ describe("configured providers", () => {
       expect(f.requests).toHaveLength(0);
     } finally { f.close(); }
   }, 25000);
+});
+
+describe("provider management commands", () => {
+  test("CLI add list and remove manage a preset connection", async () => {
+    const home = realpathSync(createIsolatedTestHome());
+    const env = {
+      HOME: home, FX_PROVIDER: undefined, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+      DEEPSEEK_API_KEY: undefined, FX_AUTO_UPGRADE: "0", NO_COLOR: "1",
+    };
+    try {
+      const added = await runFx(["provider", "add", "deepseek"], { env, timeoutMs: 15000 });
+      if (added.code !== 0) throw new Error(added.stdout + added.stderr);
+      const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      expect(settings.providers.deepseek.base_url).toBe("https://api.deepseek.com");
+      expect(settings.providers.deepseek.auth).toEqual({ type: "bearer", env: "DEEPSEEK_API_KEY" });
+      expect(settings.providers.deepseek.model_metadata["deepseek-flash"].reasoning_efforts).toEqual(["low", "high", "max"]);
+      expect(settings.providers.deepseek.model_metadata["deepseek-flash"].supports_tool_use).toBe(true);
+      expect(settings.models.deepseek).toBe("deepseek-flash");
+      expect(settings.provider).toBe("deepseek");
+
+      const listed = await runFx(["provider", "list", "--json"], { env, timeoutMs: 15000 });
+      if (listed.code !== 0) throw new Error(listed.stdout + listed.stderr);
+      const payload = JSON.parse(listed.stdout);
+      expect(payload.providers).toHaveLength(1);
+      expect(payload.providers[0].name).toBe("deepseek");
+      expect(payload.providers[0].auth).toBe("env:DEEPSEEK_API_KEY");
+      expect(payload.providers[0].selected).toBe(true);
+      expect(payload.providers[0].selected_model).toBe("deepseek-flash");
+      expect(listed.stdout).not.toContain("sk-");
+
+      const removed = await runFx(["provider", "remove", "deepseek"], { env, timeoutMs: 15000 });
+      if (removed.code !== 0) throw new Error(removed.stdout + removed.stderr);
+      const after = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
+      expect(after.providers.deepseek).toBeUndefined();
+      expect(after.provider).toBeUndefined();
+      expect(after.models.deepseek).toBeUndefined();
+    } finally {
+      cleanupIsolatedTestHome(home);
+    }
+  }, 45000);
+
+  test("added endpoint-style base URL and declared effort reach the wire once", async () => {
+    const home = realpathSync(createIsolatedTestHome());
+    const requests: Array<{ path: string; body: any }> = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        const body = await request.json();
+        requests.push({ path, body });
+        if (path !== "/v1/chat/completions") return new Response("unexpected endpoint", { status: 500 });
+        return completion(body.model);
+      },
+    });
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace);
+    const env = {
+      HOME: home, FX_PROVIDER: undefined, FX_MODEL: undefined, AI_GATEWAY_API_KEY: undefined,
+      FX_AUTO_UPGRADE: "0", NO_COLOR: "1",
+    };
+    try {
+      const base = `http://127.0.0.1:${server.port}/v1/chat/completions`;
+      const add = await runFx([
+        "provider", "add", "local", "--base-url", base, "--no-auth", "--model", "local-model",
+        "--context-window", "8192", "--reasoning-efforts", "low,high",
+      ], { env, timeoutMs: 15000 });
+      if (add.code !== 0) throw new Error(add.stdout + add.stderr);
+
+      const settingsPath = join(home, ".fx", "settings.json");
+      const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+      settings.effort = "high";
+      writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
+
+      const asked = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: workspace, env, timeoutMs: 20000 });
+      if (asked.code !== 0) throw new Error(asked.stdout + asked.stderr);
+      expect(requests).toHaveLength(1);
+      expect(requests[0].path).toBe("/v1/chat/completions");
+      expect(requests[0].body.model).toBe("local-model");
+      expect(requests[0].body.reasoning_effort).toBe("high");
+    } finally {
+      server.stop(true);
+      cleanupIsolatedTestHome(home);
+    }
+  }, 45000);
 });

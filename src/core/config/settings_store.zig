@@ -7,6 +7,7 @@ const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
+const configured_provider = @import("configured_provider.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
@@ -89,6 +90,14 @@ pub const WorkspaceDirectoryMutation = struct {
 pub const ProjectMcpMutation = struct {
     workspace_root: []const u8,
     action: project_config.ProjectMcpAction,
+};
+
+/// Profile-global configured connection edits. `upsert` carries an owned,
+/// already-validated definition while the handler runs; `remove` also clears
+/// the saved model preference and the active selection when they name it.
+pub const ProviderMutation = union(enum) {
+    upsert: configured_provider.Definition,
+    remove: []const u8,
 };
 
 pub const UserSettingsPatch = struct {
@@ -267,6 +276,7 @@ const SettingsMutation = union(enum) {
     workspace_directory: WorkspaceDirectoryMutation,
     permission: PermissionMutation,
     project_mcp: ProjectMcpMutation,
+    provider: ProviderMutation,
 
     fn operation(self: SettingsMutation) []const u8 {
         return switch (self) {
@@ -274,6 +284,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "workspace_directory_patch",
             .permission => "permission_patch",
             .project_mcp => "project_mcp_patch",
+            .provider => "provider_patch",
         };
     }
 
@@ -286,6 +297,7 @@ const SettingsMutation = union(enum) {
                 .local => .local,
             },
             .project_mcp => .local,
+            .provider => .user,
         };
     }
 
@@ -298,6 +310,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => "commit_first",
             .permission => "commit_first",
             .project_mcp => "commit_first",
+            .provider => "commit_first",
         };
     }
 
@@ -307,6 +320,7 @@ const SettingsMutation = union(enum) {
             .workspace_directory => false,
             .permission => false,
             .project_mcp => false,
+            .provider => false,
         };
     }
 };
@@ -443,6 +457,14 @@ pub const Store = struct {
         mutation: ProjectMcpMutation,
     ) !CommitOutcome {
         return self.applyMutation(alloc, .{ .project_mcp = mutation });
+    }
+
+    pub fn applyProviderMutation(
+        self: *Store,
+        alloc: Allocator,
+        mutation: ProviderMutation,
+    ) !CommitOutcome {
+        return self.applyMutation(alloc, .{ .provider = mutation });
     }
 
     fn applyMutation(
@@ -883,6 +905,17 @@ fn validateMutation(mutation: SettingsMutation) !void {
                 .approve_all, .reset => {},
             }
         },
+        .provider => |provider_mutation| switch (provider_mutation) {
+            .upsert => |definition| {
+                configured_provider.validate_id(definition.id) catch return error.InvalidDurableField;
+                if (definition.base_url.len == 0 or definition.base_url.len > 2048) return error.InvalidDurableField;
+                switch (definition.auth) {
+                    .bearer => |env| if (env.len == 0 or env.len > 128) return error.InvalidDurableField,
+                    .none, .stored => {},
+                }
+            },
+            .remove => |id| configured_provider.validate_id(id) catch return error.InvalidDurableField,
+        },
     }
 }
 
@@ -1017,9 +1050,100 @@ fn applyMutationToRoot(
         ),
         .permission => |permission| applyPermissionMutationToRoot(arena, root, permission),
         .project_mcp => |project_mcp| applyProjectMcpMutationToRoot(arena, root, project_mcp),
+        .provider => |provider_mutation| applyProviderMutationToRoot(arena, root, provider_mutation),
     };
     application.changed = application.changed or retired_settings_removed;
     return application;
+}
+
+fn applyProviderMutationToRoot(
+    arena: Allocator,
+    root: *std.json.Value,
+    mutation: ProviderMutation,
+) !PatchApplication {
+    var application = PatchApplication{};
+    if (root.object.getPtr("providers") == null) switch (mutation) {
+        .remove => return application,
+        .upsert => try root.object.put(arena, "providers", .{ .object = .empty }),
+    };
+    const providers = root.object.getPtr("providers").?;
+    if (providers.* != .object) return error.InvalidSettingsFormat;
+
+    switch (mutation) {
+        .upsert => |definition| {
+            try providers.object.put(arena, definition.id, try providerDefinitionValue(arena, definition));
+            application.changed = true;
+        },
+        .remove => |id| {
+            if (providers.object.contains(id)) {
+                _ = providers.object.orderedRemove(id);
+                application.changed = true;
+            }
+            if (root.object.getPtr("models")) |models| {
+                if (models.* != .object) return error.InvalidSettingsFormat;
+                if (models.object.contains(id)) {
+                    _ = models.object.orderedRemove(id);
+                    application.changed = true;
+                }
+            }
+            if (root.object.get("provider")) |selected| {
+                if (selected == .string and std.mem.eql(u8, selected.string, id)) {
+                    _ = root.object.orderedRemove("provider");
+                    application.changed = true;
+                }
+            }
+        },
+    }
+    if (!application.changed) return application;
+    // Root-level removals can relocate the providers entry, so the pointer is
+    // reacquired before validation rather than reused across those mutations.
+    const updated_providers = root.object.getPtr("providers").?;
+    var registry = configured_provider.Registry.parse(arena, updated_providers.*) catch
+        return error.InvalidConfiguredProvider;
+    registry.deinit(arena);
+    return application;
+}
+
+fn providerDefinitionValue(arena: Allocator, definition: configured_provider.Definition) !std.json.Value {
+    var object: std.json.ObjectMap = .empty;
+    try object.put(arena, "protocol", .{ .string = "openai-chat-completions" });
+    try object.put(arena, "base_url", .{ .string = definition.base_url });
+    var auth: std.json.ObjectMap = .empty;
+    switch (definition.auth) {
+        .none => try auth.put(arena, "type", .{ .string = "none" }),
+        .stored => try auth.put(arena, "type", .{ .string = "stored" }),
+        .bearer => |env| {
+            try auth.put(arena, "type", .{ .string = "bearer" });
+            try auth.put(arena, "env", .{ .string = env });
+        },
+    }
+    try object.put(arena, "auth", .{ .object = auth });
+    if (definition.tool_choice_mode != .omit) {
+        try object.put(arena, "tool_choice_mode", .{ .string = @tagName(definition.tool_choice_mode) });
+    }
+    if (definition.reviewer_model) |model| {
+        try object.put(arena, "reviewer_model", .{ .string = model });
+    }
+    if (definition.model_metadata.len != 0) {
+        var metadata: std.json.ObjectMap = .empty;
+        for (definition.model_metadata) |entry| {
+            var fields: std.json.ObjectMap = .empty;
+            if (entry.context_window) |value| try fields.put(arena, "context_window", .{ .integer = value });
+            if (entry.max_output_tokens) |value| try fields.put(arena, "max_output_tokens", .{ .integer = value });
+            if (entry.supports_tool_use) |value| try fields.put(arena, "supports_tool_use", .{ .bool = value });
+            if (entry.supports_vision) |value| try fields.put(arena, "supports_vision", .{ .bool = value });
+            if (entry.reasoning_efforts.len != 0) {
+                var efforts = std.json.Array.init(arena);
+                for (entry.reasoning_efforts) |*effort| {
+                    try efforts.append(.{ .string = effort.label() });
+                }
+                try fields.put(arena, "reasoning_efforts", .{ .array = efforts });
+            }
+            try metadata.put(arena, entry.id, .{ .object = fields });
+        }
+        try object.put(arena, "model_metadata", .{ .object = metadata });
+    }
+    return .{ .object = object };
 }
 
 fn applyUserPatchToRoot(
@@ -1832,7 +1956,7 @@ fn validateCandidate(
     if (parsed.value != .object) return error.InvalidSettingsFormat;
     try validateKnownSettingsObject(parsed.value.object, false);
     const workspace_root = switch (mutation) {
-        .user => return,
+        .user, .provider => return,
         .workspace_directory => |workspace| workspace.workspace_root,
         .permission => |permission| switch (permission.scope) {
             .user => return,
@@ -2210,6 +2334,112 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"notifications\":{\"turn_end\":true,\"attention_required\":false}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
+}
+
+test "provider patch upserts a validated connection and preserves unrelated keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"future\":{\"nested\":7},\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    const metadata = [_]configured_provider.ModelMetadata{.{
+        .id = "deepseek-flash",
+        .context_window = 1_000_000,
+        .max_output_tokens = 393_216,
+        .supports_tool_use = true,
+        .reasoning_efforts = &efforts,
+    }};
+    var outcome = try store.applyProviderMutation(alloc, .{ .upsert = .{
+        .id = "deepseek",
+        .protocol = .@"openai-chat-completions",
+        .base_url = "https://api.deepseek.com",
+        .auth = .{ .bearer = "DEEPSEEK_API_KEY" },
+        .model_metadata = &metadata,
+    } });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+    try std.testing.expectEqual(SettingsScope.user, outcome.committed.scope);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(
+        u8,
+        bytes,
+        "\"deepseek\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://api.deepseek.com\",\"auth\":{\"type\":\"bearer\",\"env\":\"DEEPSEEK_API_KEY\"},\"model_metadata\":{\"deepseek-flash\":{\"context_window\":1000000,\"max_output_tokens\":393216,\"supports_tool_use\":true,\"reasoning_efforts\":[\"low\",\"high\"]}}}",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"local\":{\"protocol\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
+}
+
+test "provider patch remove clears the connection model and active selection" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"provider\":\"local\",\"models\":{\"local\":\"llama3\",\"gateway\":\"openai/gpt-5.4\"},\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyProviderMutation(alloc, .{ .remove = "local" });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"provider\"") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"local\"") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"gateway\":\"openai/gpt-5.4\"") != null);
+
+    var unchanged = try store.applyProviderMutation(alloc, .{ .remove = "local" });
+    defer unchanged.deinit(alloc);
+    try std.testing.expect(unchanged == .unchanged);
+}
+
+test "provider patch rejects reserved names and malformed definitions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    try std.testing.expectError(error.InvalidDurableField, store.applyProviderMutation(alloc, .{ .upsert = .{
+        .id = "Gateway",
+        .protocol = .@"openai-chat-completions",
+        .base_url = "https://example.com",
+        .auth = .none,
+    } }));
+    try std.testing.expectError(error.InvalidDurableField, store.applyProviderMutation(alloc, .{ .upsert = .{
+        .id = "local",
+        .protocol = .@"openai-chat-completions",
+        .base_url = "",
+        .auth = .none,
+    } }));
+    try std.testing.expectError(error.InvalidDurableField, store.applyProviderMutation(alloc, .{ .remove = "bad name" }));
 }
 
 test "user patch retires presentation settings without rejecting their values" {

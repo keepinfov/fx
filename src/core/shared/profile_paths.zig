@@ -14,6 +14,7 @@ pub const usage_recovery_dir_name = "usage-recovery";
 pub const backups_dir_name = "backups";
 pub const mcp_credentials_dir_name = "mcp-credentials";
 pub const mcp_credentials_file_name = "credentials.json";
+pub const provider_credentials_dir_name = "provider-credentials";
 
 const settings_file_name = "settings.json";
 const mcp_config_file_name = "mcp.json";
@@ -45,6 +46,10 @@ pub fn mcpCredentialsPath(alloc: Allocator, home: []const u8) ![]u8 {
         mcp_credentials_dir_name,
         mcp_credentials_file_name,
     });
+}
+
+pub fn providerCredentialsDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{ home, root_dir_name, provider_credentials_dir_name });
 }
 
 pub fn managedSkillsDir(alloc: Allocator, home: []const u8) ![]u8 {
@@ -121,6 +126,13 @@ test "profile path helpers preserve current default locations" {
     try std.testing.expectEqualStrings(
         "/tmp/fake-home/.fx/mcp-credentials/credentials.json",
         mcp_credentials,
+    );
+
+    const provider_credentials = try providerCredentialsDir(alloc, "/tmp/fake-home");
+    defer alloc.free(provider_credentials);
+    try std.testing.expectEqualStrings(
+        "/tmp/fake-home/.fx/provider-credentials",
+        provider_credentials,
     );
 
     const skills = try managedSkillsDir(alloc, "/tmp/fake-home");

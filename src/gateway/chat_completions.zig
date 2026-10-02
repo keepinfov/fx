@@ -104,7 +104,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     }
     switch (definition.auth) {
         .none => if (token != null) return error.UnexpectedConfiguredProviderCredential,
-        .bearer => if (token == null) return error.MissingConfiguredProviderCredential,
+        .bearer, .stored => if (token == null) return error.MissingConfiguredProviderCredential,
     }
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
@@ -202,12 +202,15 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
+/// `reasoning_efforts` stays empty because the caller decides ownership; use
+/// `metadata_capabilities` when the entry is not materialized.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
     return .{
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
+        .has_reasoning = metadata.reasoning_efforts.len > 0,
         // Chat completions sends images as inline base64 content parts, so
         // vision support implies file input through the same path.
         .has_vision = vision,
@@ -217,9 +220,24 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
     };
 }
 
+/// Same fields `fromCatalogEntry(metadata_entry(...))` would project, with the
+/// declared efforts copied directly so no catalog entry owns borrowed memory.
+fn metadata_capabilities(metadata: definitions.ModelMetadata) model_capabilities.Capabilities {
+    const vision = metadata.supports_vision orelse false;
+    return model_capabilities.mergeCapabilities(.{}, .{
+        .supports_reasoning = metadata.reasoning_efforts.len > 0,
+        .reasoning_efforts = .fromSlice(metadata.reasoning_efforts),
+        .supports_tool_use = metadata.supports_tool_use orelse false,
+        .supports_vision = vision,
+        .supports_file_input = vision,
+        .context_window = metadata.context_window,
+        .max_output_tokens = metadata.max_output_tokens,
+    });
+}
+
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
-    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    return metadata_capabilities(metadata.*);
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
@@ -233,6 +251,9 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        entry.reasoning_efforts = .empty;
+        try entry.reasoning_efforts.appendSlice(alloc, metadata.reasoning_efforts);
+        errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
@@ -241,7 +262,7 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
 test "configured capability lookup matches catalog projection and preserves unknowns" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true,"reasoning_efforts":["low","max"]},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
     );
     defer registry.deinit(alloc);
     const provider = bundle(registry.get("local").?).model_catalog.?;
@@ -258,6 +279,11 @@ test "configured capability lookup matches catalog projection and preserves unkn
         );
     }
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
+    const small_caps = provider.lookupCapabilities("small").?;
+    try std.testing.expectEqual(@as(usize, 2), small_caps.reasoning_efforts.len);
+    try std.testing.expect(small_caps.supports_reasoning);
+    try std.testing.expect(types.ReasoningEffort.eql(.literal("low"), small_caps.reasoning_efforts.values[0]));
+    try std.testing.expect(types.ReasoningEffort.eql(.literal("max"), small_caps.reasoning_efforts.values[1]));
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
     try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
     try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);

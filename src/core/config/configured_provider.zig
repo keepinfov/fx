@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const types = @import("../shared/types.zig");
 
 const max_providers = 32;
 const max_models = 256;
@@ -8,6 +9,8 @@ pub const max_model_bytes = 1024;
 const max_url_bytes = 2048;
 const max_env_bytes = 128;
 const max_json_bytes = 1024 * 1024;
+
+const chat_completions_path = "/chat/completions";
 
 pub const ParseError = Allocator.Error || error{
     InvalidJson,
@@ -33,9 +36,12 @@ pub const ToolChoiceMode = enum { omit, send };
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
+/// `stored` reads the fx-managed provider credential store, keyed by this
+/// definition's binding identity.
 pub const Auth = union(enum) {
     none,
     bearer: []const u8,
+    stored,
 };
 
 pub const ModelMetadata = struct {
@@ -44,6 +50,9 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    /// Named efforts the endpoint accepts for `reasoning_effort`, in menu
+    /// order. Empty leaves reasoning options unavailable for this model.
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -58,8 +67,13 @@ pub const Definition = struct {
     model_metadata: []const ModelMetadata = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
+    /// A base_url that already names the chat completions endpoint is accepted
+    /// unchanged so pasted endpoint URLs cannot produce a doubled path.
     pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+        if (std.mem.endsWith(u8, self.base_url, chat_completions_path)) {
+            return alloc.dupe(u8, self.base_url);
+        }
+        return std.mem.concat(alloc, u8, &.{ self.base_url, chat_completions_path });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -82,7 +96,7 @@ pub const Definition = struct {
         hash_part(&hash, self.base_url);
         hash_part(&hash, @tagName(self.auth));
         switch (self.auth) {
-            .none => {},
+            .none, .stored => {},
             .bearer => |env| hash_part(&hash, env),
         }
         return hash.finalResult();
@@ -92,11 +106,14 @@ pub const Definition = struct {
         alloc.free(self.id);
         alloc.free(self.base_url);
         switch (self.auth) {
-            .none => {},
+            .none, .stored => {},
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| {
+            alloc.free(metadata.id);
+            alloc.free(metadata.reasoning_efforts);
+        }
         alloc.free(self.model_metadata);
     }
 };
@@ -188,10 +205,11 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
     errdefer alloc.free(owned_url);
     const owned_auth: Auth = switch (auth) {
         .none => .none,
+        .stored => .stored,
         .bearer => |env| .{ .bearer = try alloc.dupe(u8, env) },
     };
     errdefer switch (owned_auth) {
-        .none => {},
+        .none, .stored => {},
         .bearer => |env| alloc.free(env),
     };
     const owned_reviewer = if (reviewer) |model_id| try alloc.dupe(u8, model_id) else null;
@@ -215,6 +233,10 @@ fn parse_auth(value: std.json.Value) ParseError!Auth {
         if (value.object.contains("env")) return error.InvalidAuth;
         return .none;
     }
+    if (std.mem.eql(u8, kind.string, "stored")) {
+        if (value.object.contains("env")) return error.InvalidAuth;
+        return .stored;
+    }
     if (!std.mem.eql(u8, kind.string, "bearer")) return error.InvalidAuth;
     const env = try required(value, "env");
     if (env != .string) return error.InvalidEnvironmentName;
@@ -232,29 +254,53 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
     errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
+        for (models[0..initialized]) |metadata| {
+            alloc.free(metadata.id);
+            alloc.free(metadata.reasoning_efforts);
+        }
         alloc.free(models);
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
-        models[initialized] = .{
+        var parsed = ModelMetadata{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
         };
+        errdefer alloc.free(parsed.id);
+        parsed.reasoning_efforts = try parse_reasoning_efforts(alloc, metadata.object.get("reasoning_efforts"));
+        models[initialized] = parsed;
         initialized += 1;
     }
     return models;
+}
+
+fn parse_reasoning_efforts(alloc: Allocator, value: ?std.json.Value) ParseError![]types.ReasoningEffort {
+    const present = value orelse return alloc.alloc(types.ReasoningEffort, 0);
+    if (present != .array) return error.InvalidModelMetadata;
+    if (present.array.items.len > types.ReasoningEffort.max_options) return error.InvalidModelMetadata;
+    const efforts = try alloc.alloc(types.ReasoningEffort, present.array.items.len);
+    errdefer alloc.free(efforts);
+    for (present.array.items, 0..) |item, index| {
+        if (item != .string) return error.InvalidModelMetadata;
+        const effort = types.ReasoningEffort.parse(item.string) orelse return error.InvalidModelMetadata;
+        if (effort.isDefault()) return error.InvalidModelMetadata;
+        for (efforts[0..index]) |existing| {
+            if (types.ReasoningEffort.eql(existing, effort)) return error.InvalidModelMetadata;
+        }
+        efforts[index] = effort;
+    }
+    return efforts;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -369,7 +415,7 @@ fn hash_part(hash: *std.crypto.hash.sha2.Sha256, part: []const u8) void {
 
 const test_json =
     \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1/","auth":{"type":"none"}},
-    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false},"unknown":{}}}}
+    \\"router":{"protocol":"openai-chat-completions","base_url":"https://openrouter.ai/api/v1","auth":{"type":"bearer","env":"OPENROUTER_API_KEY"},"tool_choice_mode":"send","reviewer_model":"openai/review","model_metadata":{"openai/gpt-4.1":{"context_window":8192,"max_output_tokens":1024,"supports_tool_use":true,"supports_vision":false,"reasoning_efforts":["low","high"]},"unknown":{}}}}
 ;
 
 test "configured provider owns definitions and preserves unknown metadata" {
@@ -395,7 +441,11 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqual(@as(?u32, 1024), metadata.max_output_tokens);
     try std.testing.expectEqual(@as(?bool, true), metadata.supports_tool_use);
     try std.testing.expectEqual(@as(?bool, false), metadata.supports_vision);
+    try std.testing.expectEqual(@as(usize, 2), metadata.reasoning_efforts.len);
+    try std.testing.expect(types.ReasoningEffort.eql(.literal("low"), metadata.reasoning_efforts[0]));
+    try std.testing.expect(types.ReasoningEffort.eql(.literal("high"), metadata.reasoning_efforts[1]));
     const unknown = router.model("unknown").?;
+    try std.testing.expect(unknown.reasoning_efforts.len == 0);
     try std.testing.expect(unknown.context_window == null and unknown.max_output_tokens == null);
     try std.testing.expect(unknown.supports_tool_use == null and unknown.supports_vision == null);
     try std.testing.expect(router.model("missing") == null);
@@ -427,6 +477,27 @@ test "configured provider URL policy and prefix normalization" {
     for (insecure) |url| try std.testing.expectError(error.InsecureBaseUrl, validate_url(url));
 }
 
+test "configured provider accepts an explicit chat completions endpoint once" {
+    const alloc = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "https://api.deepseek.com", "https://api.deepseek.com/chat/completions" },
+        .{ "https://api.deepseek.com/", "https://api.deepseek.com/chat/completions" },
+        .{ "https://api.deepseek.com/chat/completions", "https://api.deepseek.com/chat/completions" },
+        .{ "https://api.deepseek.com/chat/completions/", "https://api.deepseek.com/chat/completions" },
+        .{ "https://api.deepseek.com/v1/chat/completions", "https://api.deepseek.com/v1/chat/completions" },
+        .{ "https://api.deepseek.com/v1/chat/completions/", "https://api.deepseek.com/v1/chat/completions" },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(alloc, "{{\"deepseek\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"{s}\",\"auth\":{{\"type\":\"none\"}}}}}}", .{case[0]});
+        defer alloc.free(json);
+        var registry = try Registry.parse_json(alloc, json);
+        defer registry.deinit(alloc);
+        const url = try registry.get("deepseek").?.chat_url(alloc);
+        defer alloc.free(url);
+        try std.testing.expectEqualStrings(case[1], url);
+    }
+}
+
 test "configured provider binding identity separates name endpoint and auth slot" {
     var registry = try Registry.parse_json(std.testing.allocator, test_json);
     defer registry.deinit(std.testing.allocator);
@@ -443,6 +514,8 @@ test "configured provider binding identity separates name endpoint and auth slot
     changed.auth = .{ .bearer = "OTHER_KEY" };
     try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
     changed.auth = .none;
+    try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
+    changed.auth = .stored;
     try std.testing.expect(!std.mem.eql(u8, &identity, &changed.binding_identity()));
     changed = original;
     changed.base_url = try validate_url("https://openrouter.ai/api/v1/");
@@ -513,11 +586,18 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_tool_use\":1}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_vision\":null}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_search\":true}}}}", .err = error.UnknownField },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_effort\":[\"high\"]}}}}", .err = error.UnknownField },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":\"high\"}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[1]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"contains space\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"auto\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"high\",\"high\"]}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"reasoning_efforts\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\",\"j\",\"k\",\"l\",\"m\",\"n\",\"o\",\"p\",\"q\"]}}}}", .err = error.InvalidModelMetadata },
     };
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
 }
 
-test "configured provider auth admits only explicit none or a portable environment slot" {
+test "configured provider auth admits only explicit none, stored, or a portable environment slot" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { json: []const u8, err: ParseError }{
         .{ .json = "null", .err = error.InvalidObject },
@@ -526,6 +606,9 @@ test "configured provider auth admits only explicit none or a portable environme
         .{ .json = "{\"type\":\"basic\"}", .err = error.InvalidAuth },
         .{ .json = "{\"type\":\"none\",\"env\":\"KEY\"}", .err = error.InvalidAuth },
         .{ .json = "{\"type\":\"none\",\"env\":null}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"stored\",\"env\":\"KEY\"}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"stored\",\"env\":null}", .err = error.InvalidAuth },
+        .{ .json = "{\"type\":\"stored\",\"token\":\"literal\"}", .err = error.UnknownField },
         .{ .json = "{\"type\":\"bearer\"}", .err = error.MissingField },
         .{ .json = "{\"type\":\"bearer\",\"env\":null}", .err = error.InvalidEnvironmentName },
         .{ .json = "{\"type\":\"bearer\",\"env\":\"\"}", .err = error.InvalidEnvironmentName },
@@ -544,6 +627,9 @@ test "configured provider auth admits only explicit none or a portable environme
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"bearer\",\"env\":\"_key_2\"}", .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("_key_2", (try parse_auth(parsed.value)).bearer);
+    var stored_parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"stored\"}", .{});
+    defer stored_parsed.deinit();
+    try std.testing.expectEqual(Auth.stored, try parse_auth(stored_parsed.value));
 }
 
 test "configured provider scalar bounds and minimum input budget" {

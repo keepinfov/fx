@@ -4804,6 +4804,9 @@ test {
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
+    _ = @import("core/config/provider_presets.zig");
+    _ = @import("core/auth/provider_secret_store.zig");
+    _ = @import("core/auth/credentials.zig");
     _ = @import("core/session/session_title_generation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");

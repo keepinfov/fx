@@ -165,7 +165,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -602,6 +602,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (request.provider_options.reasoning) |reasoning| {
+        if (reasoning.gatewayValue()) |effort| {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(effort, .{}, writer);
+        }
+    }
     try writer.writeByte('}');
 }
 
@@ -1775,6 +1781,27 @@ test "chat completions omits tool controls when no tools are advertised" {
     try std.testing.expect(parsed.value.object.get("parallel_tool_calls") == null);
 }
 
+test "chat completions serializes declared reasoning effort and omits default" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    request.provider_options.reasoning = types.ReasoningEffort.literal("high");
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("high", parsed.value.object.get("reasoning_effort").?.string);
+    request.provider_options.reasoning = .auto;
+    const default_body = try build_request(alloc, request, .{});
+    defer alloc.free(default_body);
+    try std.testing.expect(std.mem.find(u8, default_body, "reasoning_effort") == null);
+    request.provider_options.reasoning = types.ReasoningEffort.literal("max");
+    const max_body = try build_request(alloc, request, .{});
+    defer alloc.free(max_body);
+    var max_parsed = try std.json.parseFromSlice(std.json.Value, alloc, max_body, .{});
+    defer max_parsed.deinit();
+    try std.testing.expectEqualStrings("max", max_parsed.value.object.get("reasoning_effort").?.string);
+}
+
 test "chat completions exact text wire preserves instruction order and opaque model" {
     const alloc = std.testing.allocator;
     const body = try build_request(alloc, test_request(), .{});
@@ -2025,8 +2052,6 @@ test "chat completions serializes user message images as content parts" {
 test "chat completions rejects unsupported requests and ambiguous selection" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.provider_options.reasoning = .auto;
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .fast = true };
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .prompt_caching = true };

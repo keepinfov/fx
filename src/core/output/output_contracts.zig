@@ -362,6 +362,168 @@ pub const WorkspaceSnapshot = struct {
     }
 };
 
+pub const ProviderEntrySnapshot = struct {
+    name: []const u8,
+    base_url: []const u8,
+    auth: []const u8,
+    stored_credential_present: bool,
+    selected: bool,
+    selected_model: ?[]const u8,
+    models: []const []const u8,
+};
+
+pub const ProviderListSnapshot = struct {
+    providers: []const ProviderEntrySnapshot,
+
+    pub fn render(self: ProviderListSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderText(self: ProviderListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        if (self.providers.len == 0) {
+            try out.writer.writeAll("[providers] (none)\n");
+            return try out.toOwnedSlice();
+        }
+        for (self.providers) |provider| {
+            try out.writer.writeAll("[providers] ");
+            try writeTerminalSafe(&out.writer, alloc, provider.name);
+            try out.writer.writeAll(" base_url=");
+            try writeTerminalSafe(&out.writer, alloc, provider.base_url);
+            try out.writer.writeAll(" auth=");
+            try writeTerminalSafe(&out.writer, alloc, provider.auth);
+            try out.writer.print(" stored_credential={} selected={}", .{ provider.stored_credential_present, provider.selected });
+            if (provider.selected_model) |model| {
+                try out.writer.writeAll(" model=");
+                try writeTerminalSafe(&out.writer, alloc, model);
+            }
+            if (provider.models.len != 0) {
+                try out.writer.writeAll(" models=");
+                for (provider.models, 0..) |model, index| {
+                    if (index > 0) try out.writer.writeByte(',');
+                    try writeTerminalSafe(&out.writer, alloc, model);
+                }
+            }
+            try out.writer.writeByte('\n');
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn renderJson(self: ProviderListSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"providers\",\"providers\":[");
+        for (self.providers, 0..) |provider, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"name\":");
+            try std.json.Stringify.value(provider.name, .{}, &out.writer);
+            try out.writer.writeAll(",\"base_url\":");
+            try std.json.Stringify.value(provider.base_url, .{}, &out.writer);
+            try out.writer.writeAll(",\"auth\":");
+            try std.json.Stringify.value(provider.auth, .{}, &out.writer);
+            try out.writer.print(",\"stored_credential_present\":{},\"selected\":{}", .{
+                provider.stored_credential_present,
+                provider.selected,
+            });
+            try out.writer.writeAll(",\"selected_model\":");
+            if (provider.selected_model) |model| {
+                try std.json.Stringify.value(model, .{}, &out.writer);
+            } else {
+                try out.writer.writeAll("null");
+            }
+            try out.writer.writeAll(",\"models\":[");
+            for (provider.models, 0..) |model, model_index| {
+                if (model_index > 0) try out.writer.writeByte(',');
+                try std.json.Stringify.value(model, .{}, &out.writer);
+            }
+            try out.writer.writeAll("]}");
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+pub const ProviderMutationSnapshot = struct {
+    action: []const u8,
+    name: []const u8,
+    base_url: ?[]const u8 = null,
+    auth: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    selected: bool = false,
+    secret_saved: bool = false,
+    secret_removed: bool = false,
+
+    pub fn render(self: ProviderMutationSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderText(self: ProviderMutationSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("[provider] {s} ", .{self.action});
+        try writeTerminalSafe(&out.writer, alloc, self.name);
+        if (self.base_url) |base_url| {
+            try out.writer.writeAll(" base_url=");
+            try writeTerminalSafe(&out.writer, alloc, base_url);
+        }
+        if (self.auth) |auth| {
+            try out.writer.writeAll(" auth=");
+            try writeTerminalSafe(&out.writer, alloc, auth);
+        }
+        try out.writer.print(" selected={} secret_saved={} secret_removed={}", .{
+            self.selected,
+            self.secret_saved,
+            self.secret_removed,
+        });
+        if (self.model) |model| {
+            try out.writer.writeAll(" model=");
+            try writeTerminalSafe(&out.writer, alloc, model);
+        }
+        try out.writer.writeByte('\n');
+        return try out.toOwnedSlice();
+    }
+
+    fn renderJson(self: ProviderMutationSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"provider\",\"action\":");
+        try std.json.Stringify.value(self.action, .{}, &out.writer);
+        try out.writer.writeAll(",\"name\":");
+        try std.json.Stringify.value(self.name, .{}, &out.writer);
+        try out.writer.writeAll(",\"base_url\":");
+        if (self.base_url) |base_url| {
+            try std.json.Stringify.value(base_url, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"auth\":");
+        if (self.auth) |auth| {
+            try std.json.Stringify.value(auth, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.writeAll(",\"model\":");
+        if (self.model) |model| {
+            try std.json.Stringify.value(model, .{}, &out.writer);
+        } else {
+            try out.writer.writeAll("null");
+        }
+        try out.writer.print(",\"selected\":{},\"secret_saved\":{},\"secret_removed\":{}}}", .{
+            self.selected,
+            self.secret_saved,
+            self.secret_removed,
+        });
+        return try out.toOwnedSlice();
+    }
+};
+
 fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) !void {
     var encoded = try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
     defer encoded.deinit(alloc);

@@ -330,7 +330,7 @@ pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
         error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
-        error.ConfiguredModelNotSelected => "no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run,
+        error.ConfiguredModelNotSelected => "no model is selected for this connection; run `fx provider add <name> --model <id>` to save one, " ++ for_this_run,
         else => null,
     };
 }
@@ -1100,6 +1100,24 @@ pub fn attemptUserPreferences(
     };
     defer store.deinit(alloc);
     const outcome = store.applyUserPatch(alloc, patch) catch |err| {
+        return .{ .failure = .{
+            .err = err,
+            .cleanup = store.takeFailureCleanup(),
+        } };
+    };
+    return .{ .outcome = outcome };
+}
+
+pub fn attemptProviderMutation(
+    alloc: Allocator,
+    mutation: settings_store.ProviderMutation,
+) CommitAttempt {
+    const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
+        return .{ .failure = .{ .err = err } };
+    };
+    defer store.deinit(alloc);
+    const outcome = store.applyProviderMutation(alloc, mutation) catch |err| {
         return .{ .failure = .{
             .err = err,
             .cleanup = store.takeFailureCleanup(),
@@ -4650,6 +4668,8 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
     try std.testing.expect(std.mem.find(u8, codex, "`fx provider codex`") != null);
     try std.testing.expect(std.mem.find(u8, codex, "--model or FX_MODEL") != null);
     try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`fx provider grok`") != null);
-    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.ConfiguredModelNotSelected).?, "\"models\" in ~/.fx/settings.json") != null);
+    const configured = modelNotSelectedMessage(error.ConfiguredModelNotSelected).?;
+    try std.testing.expect(std.mem.find(u8, configured, "`fx provider add <name> --model <id>`") != null);
+    try std.testing.expect(std.mem.find(u8, configured, "--model or FX_MODEL") != null);
     try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
 }
