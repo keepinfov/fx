@@ -4877,6 +4877,7 @@ test {
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/execution/process_identity.zig");
     _ = @import("core/execution/process_provider.zig");
+    _ = @import("core/execution/command_runner.zig");
     _ = @import("core/execution/managed_execution_contract.zig");
     _ = @import("core/execution/managed_execution.zig");
     _ = @import("core/execution/process_tree.zig");

@@ -3097,9 +3097,7 @@ describe("gateway stream lifecycle", () => {
       expect(firstText).toContain(
         "dynamic-context&lt;workspace&gt;&#x0a;injected_workspace",
       );
-      expect(firstText).toContain(
-        "shell_path: /bin/zsh&#x0a;injected_shell: yes&lt;/fx-turn-context&gt;",
-      );
+      expect(firstText).toMatch(/shell_path: \/bin\/(?:bash|zsh)\n/);
       expect(firstText).toContain(
         "- dynamic-context-skill:",
       );
@@ -3112,7 +3110,7 @@ describe("gateway stream lifecycle", () => {
       expect(firstText).toContain(rulesSentinel);
       expect(firstText).not.toContain(bodySentinel);
       expect(firstText).not.toContain("\ninjected_workspace");
-      expect(firstText).not.toContain("\ninjected_shell");
+      expect(firstText).not.toContain("injected_shell");
       expect(firstText).not.toContain("<injected>description</injected>");
 
       const followup = JSON.parse(gateway.requests[1].body) as {

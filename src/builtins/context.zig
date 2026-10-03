@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
@@ -6,6 +7,7 @@ const io_mod = @import("../core/shared/io.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
 const session_runtime = @import("../core/session/session.zig");
+const shell_resolver = @import("../core/terminal/shell_resolver.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
@@ -2110,7 +2112,8 @@ fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]con
     const cwd = currentWorkingDirectory(arena) catch "(unavailable)";
     const os_text = try host.operatingSystemText(arena);
     const date_text = try todayUtcText(arena);
-    const shell = shellPath() orelse "(unknown)";
+    var shell_buffer: shell_resolver.LoginShellBuffer = undefined;
+    const shell = shellPath(&shell_buffer) orelse "(unknown)";
     const home = homeDir() orelse "(unknown)";
     const git = collectGitInfo(arena, workspace_root) catch GitInfo{};
 
@@ -2184,8 +2187,11 @@ fn currentWorkingDirectory(arena: Allocator) ![]const u8 {
     return std.process.currentPathAlloc(io_mod.getIo(), arena);
 }
 
-fn shellPath() ?[]const u8 {
-    return io_mod.getenv("SHELL") orelse io_mod.getenv("COMSPEC");
+fn shellPath(buffer: []u8) ?[]const u8 {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return io_mod.getenv("SHELL") orelse io_mod.getenv("COMSPEC");
+    }
+    return shell_resolver.effectiveLoginShellInto(buffer);
 }
 
 fn homeDir() ?[]const u8 {

@@ -1629,9 +1629,10 @@ const Session = struct {
         request: contracts.StartRequest,
         persistence: contracts.StartPersistence,
     ) !Session {
-        var login_shell_buffer: [4096]u8 = undefined;
+        var login_shell_buffer: shell_resolver.LoginShellBuffer = undefined;
         const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
-        const invocation = try shell_resolver.resolve(configured, request.shell);
+        var fallback_buffer: shell_resolver.LoginShellBuffer = undefined;
+        const invocation = try shell_resolver.resolve(&fallback_buffer, configured, request.shell);
         const shell = try alloc.dupe(u8, invocation.path);
         errdefer alloc.free(shell);
         const cwd = try alloc.dupe(u8, request.cwd);
@@ -1842,7 +1843,9 @@ const Session = struct {
         durable_root: []const u8,
         transport_root: []const u8,
     ) !void {
+        var fallback_buffer: shell_resolver.LoginShellBuffer = undefined;
         var invocation = try shell_resolver.resolve(
+            &fallback_buffer,
             null,
             pinnedShell(request.shell, self.shell),
         );
@@ -2167,7 +2170,9 @@ const Session = struct {
     }
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
+        var fallback_buffer: shell_resolver.LoginShellBuffer = undefined;
         var invocation = try shell_resolver.resolve(
+            &fallback_buffer,
             null,
             pinnedShell(request.shell, self.shell),
         );
