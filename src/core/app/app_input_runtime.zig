@@ -8,6 +8,7 @@ const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_menu_state = @import("../mcp/menu_state.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -2528,6 +2529,25 @@ pub fn Runtime(comptime App: type) type {
                     if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
                     try app.model_cache.openMenu();
                     app.shell.render_requests.request(.footer);
+                    return true;
+                }
+                if (selected.id == .login_shell) {
+                    var command: std.Io.Writer.Allocating = .init(app.alloc);
+                    defer command.deinit();
+                    try command.writer.writeAll("/settings login-shell ");
+                    try command.writer.writeAll(selected.value);
+                    var prepared_input = try app.input_runtime.textReplacementState().prepare(
+                        app.alloc,
+                        command.written(),
+                    );
+                    defer prepared_input.deinit(app.alloc);
+                    app.input_runtime.settings_menu.close();
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                    app.input_runtime.textReplacementState().commit(app.alloc, &prepared_input);
+                    app.input_runtime.picker.dismissInlinePicker(.slash);
+                    app.shell.render_requests.request(.footer);
+                    return true;
                 }
             }
             return true;
@@ -5469,6 +5489,25 @@ test "app_input_runtime Enter stays inside the inline settings list" {
     try std.testing.expect(app.input_runtime.settings_menu.active);
     try std.testing.expectEqual(types.PermissionMode.ask, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 0), app.worker.permission_mode_sync_count);
+}
+
+test "app_input_runtime Enter on the login shell row prefills the settings command" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    defer shell_resolver.setConfiguredLoginShell(null) catch {};
+    try shell_resolver.setConfiguredLoginShell("/bin/bash");
+    app.input_runtime.settings_menu.open();
+    app.input_runtime.settings_menu.category = .advanced;
+    app.input_runtime.settings_menu.selected_index = 2;
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(!app.input_runtime.settings_menu.active);
+    try std.testing.expectEqualStrings(
+        "/settings login-shell /bin/bash",
+        app.input_runtime.edit_state.input.items,
+    );
 }
 
 test "app_input_runtime Space edits the session catalog query" {

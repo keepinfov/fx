@@ -180,7 +180,67 @@ pub fn resolve(
     return result;
 }
 
+/// Process-wide login shell override. Like `skill_symlink_authorities`, the
+/// profile setting applies to every shell launch in the process, so startup
+/// installs it once instead of threading it through every tool caller. Later
+/// callers can still pass an explicit override to the resolution functions.
+/// Entries are owned by `std.heap.c_allocator` and guarded by the mutex.
+var configured_login_shell_mutex: std.Io.Mutex = .init;
+var configured_login_shell_override: ?[]u8 = null;
+
+/// Replaces the process-wide configured login shell with a copy of `value`.
+/// Null restores passwd-based resolution.
+pub fn setConfiguredLoginShell(value: ?[]const u8) error{OutOfMemory}!void {
+    const alloc = std.heap.c_allocator;
+    const owned: ?[]u8 = if (value) |path| try alloc.dupe(u8, path) else null;
+    const zio = io_mod.getIo();
+    configured_login_shell_mutex.lockUncancelable(zio);
+    const previous = configured_login_shell_override;
+    configured_login_shell_override = owned;
+    configured_login_shell_mutex.unlock(zio);
+    if (previous) |path| alloc.free(path);
+}
+
+/// Applies the profile login shell with the FX_LOGIN_SHELL environment
+/// override. An empty environment value counts as unset, matching FX_THEME.
+pub fn applyConfiguredLoginShell(profile_value: ?[]const u8) error{OutOfMemory}!void {
+    return setConfiguredLoginShell(effectiveConfiguredLoginShell(
+        profile_value,
+        io_mod.getenv("FX_LOGIN_SHELL"),
+    ));
+}
+
+pub fn effectiveConfiguredLoginShell(
+    profile_value: ?[]const u8,
+    env_value: ?[]const u8,
+) ?[]const u8 {
+    if (env_value) |value| {
+        if (value.len > 0) return value;
+    }
+    return profile_value;
+}
+
+/// Borrowed process-wide override. The slice remains valid until the next
+/// `setConfiguredLoginShell` call.
+pub fn configuredLoginShell() ?[]const u8 {
+    const zio = io_mod.getIo();
+    configured_login_shell_mutex.lockUncancelable(zio);
+    defer configured_login_shell_mutex.unlock(zio);
+    return configured_login_shell_override;
+}
+
+fn copyConfiguredLoginShell(buffer: []u8) ?[]const u8 {
+    const zio = io_mod.getIo();
+    configured_login_shell_mutex.lockUncancelable(zio);
+    defer configured_login_shell_mutex.unlock(zio);
+    const value = configured_login_shell_override orelse return null;
+    if (value.len == 0 or value.len > buffer.len) return null;
+    @memcpy(buffer[0..value.len], value);
+    return buffer[0..value.len];
+}
+
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
+    if (copyConfiguredLoginShell(buffer)) |value| return value;
     if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return null;
     }
@@ -610,6 +670,43 @@ test "effective login shell reports an installed path" {
     var buffer: LoginShellBuffer = undefined;
     const path = effectiveLoginShellInto(&buffer).?;
     try std.testing.expect(pathExists(path));
+}
+
+test "environment login shell override wins only when non-empty" {
+    try std.testing.expectEqualStrings(
+        "/opt/homebrew/bin/fish",
+        effectiveConfiguredLoginShell("/bin/bash", "/opt/homebrew/bin/fish").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/bin/bash",
+        effectiveConfiguredLoginShell("/bin/bash", "").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/bin/bash",
+        effectiveConfiguredLoginShell("/bin/bash", null).?,
+    );
+    try std.testing.expect(effectiveConfiguredLoginShell(null, null) == null);
+}
+
+test "process-wide login shell override replaces passwd resolution" {
+    defer setConfiguredLoginShell(null) catch {};
+    try setConfiguredLoginShell("/opt/homebrew/bin/fish");
+    try std.testing.expectEqualStrings(
+        "/opt/homebrew/bin/fish",
+        configuredLoginShell().?,
+    );
+
+    var buffer: LoginShellBuffer = undefined;
+    const configured = configuredLoginShellInto(&buffer).?;
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/fish", configured);
+
+    var fallback_buffer: LoginShellBuffer = undefined;
+    const invocation = try resolve(&fallback_buffer, configured, .user_login);
+    try std.testing.expect(pathExists(invocation.path));
+    try std.testing.expect(!std.mem.eql(u8, invocation.path, configured));
+
+    try setConfiguredLoginShell(null);
+    try std.testing.expect(configuredLoginShell() == null);
 }
 
 test "captured profiles use exact non-PTY argv" {

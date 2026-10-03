@@ -36,6 +36,7 @@ pub const SettingId = enum {
     sound_level,
     startup_scrollback,
     prompt_history,
+    login_shell,
 };
 
 pub const Spec = struct {
@@ -61,6 +62,8 @@ pub const Snapshot = struct {
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
+    /// Configured login shell path, or "default" when passwd applies.
+    login_shell: []const u8 = "default",
 
     pub fn value(self: Snapshot, id: SettingId) []const u8 {
         return switch (id) {
@@ -77,6 +80,7 @@ pub const Snapshot = struct {
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
+            .login_shell => self.login_shell,
         };
     }
 };
@@ -268,6 +272,7 @@ const specs = [_]Spec{
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
+    .{ .id = .login_shell, .category = .advanced, .label = "Login shell", .description = "Choose the shell used for user-login commands; press enter to edit" },
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
@@ -353,7 +358,7 @@ pub fn changeAt(snapshot: *const Snapshot, id: SettingId, option_index: usize) ?
 
 fn staticOptionsFor(id: SettingId) []const []const u8 {
     return switch (id) {
-        .model, .effort => &.{},
+        .model, .effort, .login_shell => &.{},
         .fast_mode,
         .statusline_context,
         .statusline_session,
@@ -419,11 +424,11 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
-    try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
+    try std.testing.expectEqual(@as(usize, 3), filteredCount(snapshot, .advanced, ""));
 
     const current_model = itemAt(snapshot, .all, "glm 5.2", 0).?;
     try std.testing.expectEqual(SettingId.model, current_model.id);
@@ -534,6 +539,20 @@ test "settings menu navigates rows and changes selected values inline" {
 
     menu.openWithStartupScrollback(false);
     try std.testing.expect(!menu.startup_scrollback);
+}
+
+test "settings catalog exposes the login shell as an edit-only row" {
+    const snapshot: Snapshot = .{ .login_shell = "/run/current-system/sw/bin/bash" };
+    const item = itemAt(snapshot, .advanced, "login shell", 0).?;
+
+    try std.testing.expectEqual(SettingId.login_shell, item.id);
+    try std.testing.expectEqualStrings("Login shell", item.label);
+    try std.testing.expectEqualStrings("/run/current-system/sw/bin/bash", item.value);
+    try std.testing.expectEqual(@as(usize, 0), optionCount(&snapshot, .login_shell));
+    try std.testing.expect(changeAt(&snapshot, .login_shell, 0) == null);
+
+    const fallback: Snapshot = .{};
+    try std.testing.expectEqualStrings("default", fallback.value(.login_shell));
 }
 
 test "notification level keeps the existing off on and max policy" {

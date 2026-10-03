@@ -8,6 +8,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -284,6 +285,15 @@ pub fn Commands(comptime App: type) type {
                 preferred = settings.credential_source;
             }
             const auth = app.auth.statusSnapshot(provider, preferred);
+            var login_shell_buffer: shell_resolver.LoginShellBuffer = undefined;
+            const login_shell = shell_resolver.effectiveLoginShellInto(&login_shell_buffer);
+            const env_login_shell = io_mod.getenv("FX_LOGIN_SHELL");
+            const login_shell_source: []const u8 = if (env_login_shell != null and env_login_shell.?.len > 0)
+                "env"
+            else if (shell_resolver.configuredLoginShell() != null)
+                "settings"
+            else
+                "passwd";
             const text = try (output_contracts.StatusSnapshot{
                 .model = provider_runtime.model(app),
                 .provider = provider,
@@ -301,6 +311,8 @@ pub fn Commands(comptime App: type) type {
                 .history_turns = app.session.historyLen(),
                 .session_permission_grants = app.permission_engine.grants.items.len,
                 .agent_step_limit = app.agent_step_limit,
+                .login_shell = login_shell,
+                .login_shell_source = login_shell_source,
             }).renderInteractiveBody(app.alloc);
             defer app.alloc.free(text);
             try app.writeDomainNotice(.{ .topic = "status", .tone = .neutral, .body = text }, true);
@@ -317,6 +329,31 @@ pub fn Commands(comptime App: type) type {
                 try writeSettingsUsage(app);
                 return;
             };
+
+            if (std.ascii.eqlIgnoreCase(first.word, "login-shell")) {
+                const value_split = splitFirstWord(first.rest);
+                if (value_split) |split| {
+                    if (split.rest.len != 0) {
+                        try writeSettingsUsage(app);
+                        return;
+                    }
+                    if (std.ascii.eqlIgnoreCase(split.word, "default") or
+                        std.ascii.eqlIgnoreCase(split.word, "passwd"))
+                    {
+                        try saveLoginShellSetting(app, null);
+                        return;
+                    }
+                    if (!std.fs.path.isAbsolute(split.word)) {
+                        try writeSettingsUsage(app);
+                        return;
+                    }
+                    try saveLoginShellSetting(app, split.word);
+                    return;
+                }
+                try writeSettingsStatus(app);
+                return;
+            }
+
             if (!std.ascii.eqlIgnoreCase(first.word, "startup-scrollback")) {
                 try writeSettingsUsage(app);
                 return;
@@ -942,13 +979,16 @@ pub fn Commands(comptime App: type) type {
             const settings = &detailed.settings;
 
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
-            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}", .{
+            var login_shell_buffer: shell_resolver.LoginShellBuffer = undefined;
+            const login_shell = shell_resolver.effectiveLoginShellInto(&login_shell_buffer) orelse "(unresolved)";
+            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}\nlogin_shell: {s}", .{
                 provider_runtime.model(app),
                 @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
                 permissions.permissionModeDisplayLabel(app.permission_engine.mode),
                 app.workspace_root,
                 app.agent_step_limit,
                 startup_scrollback_label,
+                login_shell,
             });
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
@@ -1007,11 +1047,70 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
+        fn saveLoginShellSetting(app: *App, path: ?[]const u8) !void {
+            const patch: config_runtime.UserSettingsPatch = if (path) |value|
+                .{ .login_shell = value }
+            else
+                .{ .clear_login_shell = true };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| {
+                    try reportUserSettingsFailure(
+                        app,
+                        "login-shell",
+                        failure.err,
+                        failure.cleanup,
+                        false,
+                    );
+                    return;
+                },
+                .outcome => |outcome| {
+                    _ = try reportUserSettingsCommit(
+                        app,
+                        "login-shell",
+                        patch,
+                        outcome,
+                        null,
+                        false,
+                    );
+                    shell_resolver.applyConfiguredLoginShell(path) catch |err| {
+                        const message = try std.fmt.allocPrint(
+                            app.alloc,
+                            "Failed to apply login shell: {s}",
+                            .{@errorName(err)},
+                        );
+                        defer app.alloc.free(message);
+                        try app.writeDomainNotice(.{
+                            .topic = "settings",
+                            .tone = .@"error",
+                            .body = message,
+                        }, true);
+                        return;
+                    };
+                    var out: std.Io.Writer.Allocating = .init(app.alloc);
+                    defer out.deinit();
+                    if (shell_resolver.configuredLoginShell()) |effective| {
+                        try out.writer.print("login_shell: {s}", .{effective});
+                    } else {
+                        try out.writer.writeAll("login_shell: default (passwd)");
+                    }
+                    if (path == null) {
+                        try out.writer.writeAll("; cleared user default");
+                    }
+                    const msg = try out.toOwnedSlice();
+                    defer app.alloc.free(msg);
+                    try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
+                    return;
+                },
+            }
+        }
+
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "usage: /settings [startup-scrollback [on|off]]",
+                .body = "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]",
             }, true);
         }
 
@@ -2025,6 +2124,7 @@ test "session_commands handleSettings shows startup scrollback status" {
     try expectTranscriptContains(&app, "permission_mode: auto");
     try expectTranscriptContains(&app, "step_limit: 12");
     try expectTranscriptContains(&app, "startup_scrollback: off");
+    try expectTranscriptContains(&app, "login_shell: ");
 }
 
 test "session_commands handleSettings toggles and persists startup scrollback" {
@@ -2172,16 +2272,68 @@ test "session_commands handleSettings reports usage and save failures" {
     defer app.deinit();
 
     try Commands(FakeApp).handleSettings(&app, "bogus");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off extra");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]]");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
     try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to user settings (HomeNotSet)");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
+}
+
+test "session_commands handleSettings saves and clears the login shell" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    defer shell_resolver.setConfiguredLoginShell(null) catch {};
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(&app, "login-shell /bin/bash");
+    try expectTranscriptContains(&app, "login_shell: /bin/bash");
+
+    var saved = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer saved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/bin/bash", saved.login_shell.?);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "login-shell default");
+    try expectTranscriptContains(&app, "login_shell: default (passwd); cleared user default");
+
+    var cleared = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(cleared.login_shell == null);
+}
+
+test "session_commands handleSettings rejects relative login shell paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const env = try SessionCommandTestHome.install(std.testing.allocator, null);
+    defer env.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(&app, "login-shell relative/bash");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]");
 }
 
 test "session_commands handleModel reports current model for empty query" {

@@ -2829,6 +2829,12 @@ fn statusSnapshotFromStartupWithBuild(
         .history_turns = 0,
         .session_permission_grants = 0,
         .agent_step_limit = startup.agent_step_limit,
+        .login_shell = startup.login_shell,
+        .login_shell_source = switch (startup.login_shell_source) {
+            .process_override => "env",
+            .user_global => "settings",
+            else => "passwd",
+        },
         .update_channel = startup.update_channel.label(),
         .build_channel = build.channel.label(),
         .build_revision = build.revision,

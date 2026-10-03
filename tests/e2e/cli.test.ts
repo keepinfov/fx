@@ -704,6 +704,36 @@ describe("cli: status", () => {
     TIMEOUT,
   );
 
+  test(
+    "status and doctor report the resolved login shell",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-login-shell-"));
+      try {
+        const env = {
+          ...NO_GATEWAY_AUTH,
+          HOME: realpathSync(root),
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_LOGIN_SHELL: "/bin/sh",
+        };
+        const status = await runFx(["status", "--json"], { env });
+        const doctor = await runFx(["doctor", "--json"], { env });
+
+        expect(status.code).toBe(0);
+        expect(doctor.code).toBe(0);
+        const statusJson = JSON.parse(status.stdout.trim());
+        const doctorJson = JSON.parse(doctor.stdout.trim());
+        expect(statusJson.login_shell).toBe("/bin/sh");
+        expect(statusJson.login_shell_source).toBe("env");
+        expect(doctorJson.checks).toContainEqual(
+          expect.objectContaining({ name: "shell", status: "ok" }),
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
   for (const scenario of [
     { name: "automatic Gateway", provider: "gateway", source: undefined, help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },

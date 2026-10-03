@@ -645,6 +645,12 @@ pub const StatusSnapshot = struct {
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
+    /// Resolved login shell executable for user_login specs. Null omits the
+    /// row for snapshots that do not resolve a shell.
+    login_shell: ?[]const u8 = null,
+    /// Where the configured login shell came from: `env`, `settings`, or
+    /// `passwd`.
+    login_shell_source: []const u8 = "passwd",
 
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -701,6 +707,10 @@ pub const StatusSnapshot = struct {
         }
         try out.writer.print("[status] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
+        if (self.login_shell) |login_shell| {
+            try out.writer.print("[status] login_shell={s}\n", .{login_shell});
+            try out.writer.print("[status] login_shell_source={s}\n", .{self.login_shell_source});
+        }
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
@@ -734,6 +744,10 @@ pub const StatusSnapshot = struct {
         if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
         try out.writer.print("permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
+        if (self.login_shell) |login_shell| {
+            try out.writer.print("login_shell={s}\n", .{login_shell});
+            try out.writer.print("login_shell_source={s}\n", .{self.login_shell_source});
+        }
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("agent_step_limit={d}", .{self.agent_step_limit});
@@ -835,6 +849,12 @@ pub const StatusSnapshot = struct {
         try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
+        if (self.login_shell) |login_shell| {
+            try writer.writeAll(",\"login_shell\":");
+            try std.json.Stringify.value(login_shell, .{}, writer);
+            try writer.writeAll(",\"login_shell_source\":");
+            try std.json.Stringify.value(self.login_shell_source, .{}, writer);
+        }
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
@@ -2115,6 +2135,35 @@ test "core status snapshot text and json stay stable" {
         "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
         json,
     );
+}
+
+test "status snapshot renders the resolved login shell and its source" {
+    const snapshot = StatusSnapshot{
+        .model = "alpha",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+        .login_shell = "/bin/bash",
+        .login_shell_source = "settings",
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "[status] login_shell=/bin/bash\n[status] login_shell_source=settings\n",
+    ) != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"login_shell\":\"/bin/bash\",\"login_shell_source\":\"settings\"",
+    ) != null);
 }
 
 test "core status snapshot includes selected team when present" {

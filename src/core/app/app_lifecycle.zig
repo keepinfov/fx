@@ -11,6 +11,7 @@ const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const shared_theme = @import("../shared/theme.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -330,12 +331,17 @@ pub const StartupStatus = struct {
     permission_mode: PermissionMode,
     agent_step_limit: usize,
     update_channel: update_target.Channel = .stable,
+    /// Resolved login shell executable for user_login specs. Null when no
+    /// shell could be resolved.
+    login_shell: ?[]u8 = null,
+    login_shell_source: config_runtime.ConfigSource = .compiled_default,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
 
     pub fn deinit(self: *StartupStatus, alloc: Allocator) void {
         alloc.free(self.workspace_root);
         if (self.provider_endpoint) |endpoint| alloc.free(endpoint);
         if (self.owned_selected_model) |model| alloc.free(model);
+        if (self.login_shell) |shell| alloc.free(shell);
         self.auth.deinit(alloc);
         if (self.config_diagnostics.len > 0) {
             for (self.config_diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -530,6 +536,32 @@ pub fn loadStartupStatusWithAuthMode(
         );
     errdefer auth_status.deinit(alloc);
 
+    const env_login_shell = io_mod.getenv("FX_LOGIN_SHELL");
+    const login_shell_source: config_runtime.ConfigSource =
+        if (env_login_shell != null and env_login_shell.?.len > 0)
+            .process_override
+        else if (settings.login_shell != null)
+            .user_global
+        else
+            .compiled_default;
+    var login_shell_value: ?[]u8 = null;
+    errdefer if (login_shell_value) |value| alloc.free(value);
+    var passwd_buffer: shell_resolver.LoginShellBuffer = undefined;
+    const passwd_shell = shell_resolver.configuredLoginShellInto(&passwd_buffer);
+    const configured = shell_resolver.effectiveConfiguredLoginShell(
+        settings.login_shell,
+        env_login_shell,
+    ) orelse passwd_shell;
+    var fallback_buffer: shell_resolver.LoginShellBuffer = undefined;
+    const resolved = shell_resolver.resolve(
+        &fallback_buffer,
+        configured,
+        .user_login,
+    ) catch null;
+    if (resolved) |invocation| {
+        login_shell_value = try alloc.dupe(u8, invocation.path);
+    }
+
     const definitions: @import("../config/configured_provider.zig").Registry = settings.providers orelse .{};
     const result = StartupStatus{
         .workspace_root = workspace_root,
@@ -542,6 +574,8 @@ pub fn loadStartupStatusWithAuthMode(
         .permission_mode = loadPermissionMode(settings.permission_mode),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .update_channel = settings.update_channel orelse .stable,
+        .login_shell = login_shell_value,
+        .login_shell_source = login_shell_source,
         .config_diagnostics = detailed.diagnostics,
     };
     auth_status.owned_team = null;
@@ -620,6 +654,9 @@ fn loadStartupStateFromOwnedWorkspace(
     // Skill authority checks run across discovery, refresh, and the skill tool,
     // so the profile setting is installed process-wide like the env var.
     try skill_runtime.setConfiguredSymlinkAuthorities(settings.skill_symlink_authorities orelse &.{});
+    // Shell launches run across tools, terminal hosts, and subagents, so the
+    // profile login shell is installed process-wide with the env override.
+    try shell_resolver.applyConfiguredLoginShell(settings.login_shell);
 
     // A launch --provider override must bind configured provider names against
     // the registry just like the settings and FX_PROVIDER paths do.
