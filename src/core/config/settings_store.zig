@@ -115,6 +115,12 @@ pub const UserSettingsPatch = struct {
     collapse_tool_calls: ?bool = null,
     update_channel: ?update_target.Channel = null,
     startup_scrollback: ?bool = null,
+    /// Absolute path to the login shell. Distinct from a null `login_shell`,
+    /// which means "leave unchanged".
+    login_shell: ?[]const u8 = null,
+    /// Removes the key entirely so resolution returns to the passwd login
+    /// shell. Distinct from a null `login_shell`.
+    clear_login_shell: bool = false,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
     session_titles: ?bool = null,
@@ -135,6 +141,8 @@ pub const UserSettingsPatch = struct {
             self.collapse_tool_calls == null and
             self.update_channel == null and
             self.startup_scrollback == null and
+            self.login_shell == null and
+            !self.clear_login_shell and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
             self.session_titles == null and
@@ -974,6 +982,81 @@ test "clearing the credential choice removes the key rather than blanking it" {
     try std.testing.expect(!application.changed);
 }
 
+test "login shell user patch writes an absolute path and clears it" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"model\":\"m\"}",
+        .{},
+    );
+    var application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .login_shell = "/bin/bash" },
+    );
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings("/bin/bash", root.object.get("login_shell").?.string);
+
+    application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .clear_login_shell = true },
+    );
+    try std.testing.expect(application.changed);
+    try std.testing.expect(!root.object.contains("login_shell"));
+    try std.testing.expect(root.object.contains("model"));
+
+    application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .clear_login_shell = true },
+    );
+    try std.testing.expect(!application.changed);
+}
+
+test "login shell settings validation requires an absolute path" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        "{\"login_shell\":\"/run/current-system/sw/bin/bash\"}",
+        .{},
+    );
+    defer valid.deinit();
+    try validateKnownSettingsObject(valid.value.object, false);
+
+    var relative = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        "{\"login_shell\":\"bash\"}",
+        .{},
+    );
+    defer relative.deinit();
+    try std.testing.expectError(
+        error.InvalidSettingsFormat,
+        validateKnownSettingsObject(relative.value.object, false),
+    );
+
+    var blank = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        "{\"login_shell\":\"  \"}",
+        .{},
+    );
+    defer blank.deinit();
+    try std.testing.expectError(
+        error.InvalidSettingsFormat,
+        validateKnownSettingsObject(blank.value.object, false),
+    );
+}
+
 test "collapse tool calls user patch writes the profile preference" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1175,6 +1258,11 @@ fn applyUserPatchToRoot(
     if (patch.collapse_tool_calls) |value| application.changed = try putBool(arena, &root.object, "collapse_tool_calls", value) or application.changed;
     if (patch.update_channel) |value| application.changed = try putString(arena, &root.object, "update_channel", value.label()) or application.changed;
     if (patch.startup_scrollback) |value| application.changed = try putBool(arena, &root.object, "startup_scrollback", value) or application.changed;
+    if (patch.login_shell) |value| application.changed = try putString(arena, &root.object, "login_shell", value) or application.changed;
+    if (patch.clear_login_shell and root.object.contains("login_shell")) {
+        _ = root.object.orderedRemove("login_shell");
+        application.changed = true;
+    }
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
 
     if (patch.prompt_history_enabled) |enabled| {
@@ -2034,6 +2122,13 @@ fn validateKnownSettingsObject(
     }
     if (object.get("theme")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
+    }
+    if (object.get("login_shell")) |value| {
+        if (value != .string) return error.InvalidSettingsFormat;
+        const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
+        if (trimmed.len == 0 or !std.fs.path.isAbsolute(trimmed)) {
+            return error.InvalidSettingsFormat;
+        }
     }
     if (object.get("credential_source")) |value| {
         if (value != .string or types.parseCredentialSource(value.string) == null) {

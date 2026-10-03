@@ -15,6 +15,7 @@ const config_runtime = @import("../core/config/config_runtime.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
+const shell_resolver = @import("../core/terminal/shell_resolver.zig");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 
 const Allocator = std.mem.Allocator;
@@ -103,6 +104,9 @@ fn loadAccess(state: *const server.ServerState, alloc: Allocator, root: []const 
         },
     };
     defer detailed.deinit(alloc);
+    shell_resolver.applyConfiguredLoginShell(detailed.settings.login_shell) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     const saved: []const []const u8 = if (detailed.additional_directory_sources) |paths| paths else &.{};
     return workspace_access.WorkspaceAccess.init(
         alloc,

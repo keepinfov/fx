@@ -113,6 +113,10 @@ Slugs are the gateway's provider identifiers (letters, digits, dashes, for examp
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
+## Login shell
+
+Shell commands run through a supported login shell (`bash`, `zsh`, `sh`, or `dash`). fx resolves it from your passwd entry and falls back to the first installed shell when the configured shell is unsupported or missing. Set `login_shell` to an absolute shell path in `~/.fx/settings.json`, or override it per launch with `FX_LOGIN_SHELL=<path>`. `fx status` reports the resolved shell and `fx doctor` warns when a configured shell is unavailable.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

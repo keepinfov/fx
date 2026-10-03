@@ -7,6 +7,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const session_store = @import("../session/session_store.zig");
+const shell_resolver = @import("../terminal/shell_resolver.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 
@@ -99,6 +100,7 @@ pub fn collect(
         try appendStateChecks(&checks, alloc, snapshot.workspace_root);
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendGhCheck(&checks, alloc);
+        try appendLoginShellCheck(&checks, alloc, null);
 
         snapshot.checks = try checks.toOwnedSlice(alloc);
         return snapshot;
@@ -130,6 +132,7 @@ pub fn collect(
     try appendStateChecks(&checks, alloc, snapshot.workspace_root);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
+    try appendLoginShellCheck(&checks, alloc, detailed.settings.login_shell);
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
     return snapshot;
@@ -511,6 +514,72 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         return;
     }
     try appendCheck(checks, alloc, "gh", .warn, "GitHub CLI not found in PATH; publish workflows unavailable");
+}
+
+fn appendLoginShellCheck(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    profile_login_shell: ?[]const u8,
+) !void {
+    const env_login_shell = io_mod.getenv("FX_LOGIN_SHELL");
+    const configured = shell_resolver.effectiveConfiguredLoginShell(
+        profile_login_shell,
+        env_login_shell,
+    );
+    const source = if (env_login_shell != null and env_login_shell.?.len > 0)
+        "FX_LOGIN_SHELL"
+    else if (profile_login_shell != null)
+        "settings"
+    else
+        "passwd";
+
+    var passwd_buffer: shell_resolver.LoginShellBuffer = undefined;
+    const passwd_shell = shell_resolver.configuredLoginShellInto(&passwd_buffer);
+    const selected = configured orelse passwd_shell;
+    var fallback_buffer: shell_resolver.LoginShellBuffer = undefined;
+    const resolved = shell_resolver.resolve(
+        &fallback_buffer,
+        selected,
+        .user_login,
+    ) catch null;
+
+    if (configured) |configured_path| {
+        const invocation = resolved orelse {
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "{s} login shell {s} is unavailable and no installed fallback exists",
+                .{ source, configured_path },
+            );
+            try appendCheckOwned(checks, alloc, "shell", .fail, detail);
+            return;
+        };
+        if (!std.mem.eql(u8, invocation.path, configured_path)) {
+            const detail = try std.fmt.allocPrint(
+                alloc,
+                "{s} login shell {s} is unavailable; using {s}",
+                .{ source, configured_path, invocation.path },
+            );
+            try appendCheckOwned(checks, alloc, "shell", .warn, detail);
+            return;
+        }
+    }
+
+    if (resolved) |invocation| {
+        const detail = try std.fmt.allocPrint(
+            alloc,
+            "login shell {s} ({s})",
+            .{ invocation.path, source },
+        );
+        try appendCheckOwned(checks, alloc, "shell", .ok, detail);
+        return;
+    }
+    try appendCheck(
+        checks,
+        alloc,
+        "shell",
+        .fail,
+        "no installed login shell found; commands cannot run",
+    );
 }
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {

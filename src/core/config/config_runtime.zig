@@ -60,6 +60,9 @@ pub const Settings = struct {
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
     theme: ?[]const u8 = null,
+    /// Absolute path to the login shell used for user_login specs. Profile
+    /// only; FX_LOGIN_SHELL overrides it per launch. Freed in deinit.
+    login_shell: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
@@ -86,6 +89,7 @@ pub const Settings = struct {
         self.permission_rules.deinit(alloc);
         if (self.review_model) |value| alloc.free(value);
         if (self.theme) |value| alloc.free(value);
+        if (self.login_shell) |value| alloc.free(value);
         if (self.provider_order) |order| {
             for (order) |slug| alloc.free(@constCast(slug));
             alloc.free(order);
@@ -814,6 +818,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "slash_menu_categories",
         "collapse_tool_calls",
         "theme",
+        "login_shell",
         "session_titles",
         "startup_scrollback",
         "prompt_history",
@@ -1374,6 +1379,10 @@ fn mergeWorkspaceOverridesFromValue(target: *Settings, alloc: Allocator, root_va
     var override_settings = try parseSettingsValueForLayer(alloc, override_val, .profile_workspace, true, false);
     defer override_settings.deinit(alloc);
     override_settings.update_channel = null;
+    if (override_settings.login_shell) |value| {
+        alloc.free(value);
+        override_settings.login_shell = null;
+    }
     override_settings.context_limits.retag(.user_workspace);
     try mergeSettings(target, &override_settings, alloc);
 }
@@ -1748,6 +1757,16 @@ fn parseProfileOnlyFields(
         if (value.string.len > 0) settings.theme = try alloc.dupe(u8, value.string);
     }
 
+    if (root.object.get("login_shell")) |login_shell_value| {
+        const value = login_shell_value;
+        if (value != .string) return error.InvalidLoginShellType;
+        const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (!std.fs.path.isAbsolute(trimmed)) return error.InvalidLoginShellPath;
+            settings.login_shell = try alloc.dupe(u8, trimmed);
+        }
+    }
+
     if (root.object.get("startup_scrollback")) |startup_scrollback_value| {
         const value = startup_scrollback_value;
         if (value != .bool) return error.InvalidStartupScrollbackType;
@@ -1952,6 +1971,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         if (target.theme) |old| alloc.free(old);
         target.theme = value;
         incoming.theme = null;
+    }
+    if (incoming.login_shell) |value| {
+        if (target.login_shell) |old| alloc.free(old);
+        target.login_shell = value;
+        incoming.login_shell = null;
     }
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
     if (incoming.skill_symlink_authorities) |value| {
@@ -3665,6 +3689,59 @@ test "user startup scrollback preference writes bool and preserves unrelated key
     try std.testing.expect((try workspaceOverrideObject(&parsed.value, workspace_root)).get("startup_scrollback") == null);
 }
 
+test "user login shell preference ignores workspace overrides and clears" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const fixture = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"workspaces\":{{\"{s}\":{{\"login_shell\":\"/bin/zsh\"}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(fixture);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var workspace_only = try loadMergedSettings(std.testing.allocator, workspace_root);
+    defer workspace_only.deinit(std.testing.allocator);
+    try std.testing.expect(workspace_only.login_shell == null);
+
+    var outcome = try setUserPreferences(
+        std.testing.allocator,
+        .{ .login_shell = "/bin/bash" },
+    );
+    defer outcome.deinit(std.testing.allocator);
+
+    var settings = try loadMergedSettings(std.testing.allocator, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/bin/bash", settings.login_shell.?);
+
+    const bytes = try readSettingsBytesForTest(std.testing.allocator, home_root);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/bin/bash", parsed.value.object.get("login_shell").?.string);
+
+    var cleared = try setUserPreferences(
+        std.testing.allocator,
+        .{ .clear_login_shell = true },
+    );
+    defer cleared.deinit(std.testing.allocator);
+
+    var after_clear = try loadMergedSettings(std.testing.allocator, workspace_root);
+    defer after_clear.deinit(std.testing.allocator);
+    try std.testing.expect(after_clear.login_shell == null);
+}
+
 test "project profile-only settings are ignored and diagnosed by key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3673,12 +3750,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"login_shell\":\"/bin/zsh\",\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"login_shell\":\"relative/bash\",\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3702,16 +3779,18 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(false, result.settings.slash_menu_categories.?);
     try std.testing.expectEqual(types.ReasoningEffort.literal("high"), result.settings.effort.?);
     try std.testing.expectEqual(false, result.settings.startup_scrollback.?);
+    try std.testing.expectEqualStrings("/bin/zsh", result.settings.login_shell.?);
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 15), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
         "permission",
         "prompt_history",
         "statusLine",
+        "login_shell",
         "skill_match_fuzzy",
         "first_call_tool_choice",
         "review_model",
