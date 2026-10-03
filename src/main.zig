@@ -4805,6 +4805,7 @@ test {
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
     _ = @import("core/config/provider_presets.zig");
+    _ = @import("core/config/provider_management.zig");
     _ = @import("core/auth/provider_secret_store.zig");
     _ = @import("core/auth/credentials.zig");
     _ = @import("core/session/session_title_generation.zig");
