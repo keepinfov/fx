@@ -58,6 +58,8 @@ pub const AddError = ComposeError || error{
     SecretRollbackFailed,
 };
 
+pub const max_secret_bytes = provider_secret_store.max_secret_bytes;
+
 pub const AddAction = enum { add, update };
 
 pub const AddOutcome = struct {
@@ -113,6 +115,29 @@ pub fn parseEfforts(alloc: Allocator, raw: []const u8) ![]const []const u8 {
         try items.append(alloc, effort);
     }
     return items.toOwnedSlice(alloc);
+}
+
+/// True when `raw` is a valid `--reasoning-efforts` value. Non-allocating so
+/// the setup wizard can validate one answer at a time.
+pub fn effortsValid(raw: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "none")) return true;
+    var seen: [16][]const u8 = undefined;
+    var count: usize = 0;
+    var iterator = std.mem.splitScalar(u8, trimmed, ',');
+    while (iterator.next()) |part| {
+        const effort = std.mem.trim(u8, part, " \t");
+        if (effort.len == 0) return false;
+        const parsed = types.ReasoningEffort.parse(effort) orelse return false;
+        if (parsed.isDefault()) return false;
+        if (count >= seen.len) return false;
+        for (seen[0..count]) |existing| {
+            if (std.mem.eql(u8, existing, effort)) return false;
+        }
+        seen[count] = effort;
+        count += 1;
+    }
+    return true;
 }
 
 pub fn validSecret(value: []const u8) bool {

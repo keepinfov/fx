@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const host_target = @import("../hosts/target.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_catalog = @import("provider_catalog.zig");
 const types = @import("../shared/types.zig");
@@ -20,7 +21,52 @@ pub const Method = enum {
     api_key,
 };
 
-pub const max_provider_options = provider_catalog.entries.len;
+/// Upper bound of configured connections in one profile. Mirrors the private
+/// `configured_provider.max_providers`.
+pub const max_configured_options = 32;
+/// Builtin catalog rows, configured connections, and the two management rows.
+pub const max_provider_options = provider_catalog.entries.len + max_configured_options + 2;
+
+/// One row of the provider column. Builtin rows open their method column,
+/// configured rows switch the active connection, and the management rows open
+/// the setup wizard or the manage column.
+pub const ProviderOption = union(enum) {
+    catalog: model_provider.ProviderId,
+    configured: []const u8,
+    add_connection,
+    manage_connections,
+};
+
+pub const add_connection_label = "add connection\u{2026}";
+pub const manage_connections_label = "manage connections\u{2026}";
+pub const manage_back_label = "back";
+pub const manage_edit_label = "edit";
+pub const manage_remove_label = "remove";
+pub const manage_cancel_label = "cancel";
+
+pub fn optionLabel(option: ProviderOption) []const u8 {
+    return switch (option) {
+        .catalog => |id| provider_catalog.find(id).slug,
+        .configured => |name| name,
+        .add_connection => add_connection_label,
+        .manage_connections => manage_connections_label,
+    };
+}
+
+/// Rebuilds the option behind a rendered label. Labels are unique: builtin
+/// slugs and configured ids never contain spaces, while the management labels
+/// do.
+pub fn optionForLabel(
+    definitions: []const configured_provider.Definition,
+    label: []const u8,
+) ?ProviderOption {
+    var options: [max_provider_options]ProviderOption = undefined;
+    const count = providerOptions(definitions, &options);
+    for (options[0..count]) |option| {
+        if (std.ascii.eqlIgnoreCase(optionLabel(option), label)) return option;
+    }
+    return null;
+}
 const max_method_options = 2;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
@@ -114,13 +160,33 @@ fn providerVisible(id: model_provider.ProviderId) bool {
     return true;
 }
 
-/// Writes the visible provider slugs into `out` and returns how many landed.
-pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
+/// Writes the visible provider rows into `out` and returns how many landed.
+/// Builtin catalog rows come first so typed filters stay familiar, then the
+/// saved connections, then `add connection…` and, when any connection exists,
+/// `manage connections…`.
+pub fn providerOptions(
+    definitions: []const configured_provider.Definition,
+    out: *[max_provider_options]ProviderOption,
+) usize {
     var count: usize = 0;
     for (&provider_catalog.entries) |*entry| {
         if (!providerVisible(entry.id)) continue;
-        out[count] = entry.slug;
+        out[count] = .{ .catalog = entry.id };
         count += 1;
+    }
+    if (comptime !host_target.is_wasm) {
+        const configured_limit = max_provider_options - 2;
+        for (definitions) |*definition| {
+            if (count >= configured_limit) break;
+            out[count] = .{ .configured = definition.id };
+            count += 1;
+        }
+        out[count] = .add_connection;
+        count += 1;
+        if (definitions.len != 0) {
+            out[count] = .manage_connections;
+            count += 1;
+        }
     }
     return count;
 }
@@ -141,15 +207,16 @@ pub fn methodMatchesSource(method: Method, source: types.CredentialSource) bool 
     };
 }
 
-test "provider options expose the catalog slugs the composer accepts" {
-    var buf: [max_provider_options][]const u8 = undefined;
-    const count = providerOptions(&buf);
-
-    try std.testing.expect(count >= 2);
-    try std.testing.expectEqualStrings("vercel", buf[0]);
-    for (buf[0..count]) |slug| {
-        try std.testing.expect(provider_catalog.parse(slug) != null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, slug, ' ') == null);
+test "provider options extend the catalog with management rows" {
+    var buf: [max_provider_options]ProviderOption = undefined;
+    const empty = providerOptions(&.{}, &buf);
+    try std.testing.expect(empty >= 1);
+    try std.testing.expectEqualStrings("vercel", optionLabel(buf[0]));
+    if (comptime !host_target.is_wasm) {
+        try std.testing.expect(empty >= 3);
+        try std.testing.expectEqualStrings(add_connection_label, optionLabel(buf[empty - 1]));
+        try std.testing.expect(optionForLabel(&.{}, add_connection_label).? == .add_connection);
+        try std.testing.expect(optionForLabel(&.{}, manage_connections_label) == null);
     }
 }
 

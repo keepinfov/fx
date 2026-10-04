@@ -650,7 +650,10 @@ fn buildFooterSurfaceProjection(
     return .{
         .active_label = active_label,
         .activity_projection = activity_projection,
-        .input_display = ctx.input.edit_state.input.items,
+        .input_display = if (ctx.provider_admin_mask_input)
+            try input_presentation.maskedInputDisplay(alloc, ctx.input.edit_state.input.items)
+        else
+            ctx.input.edit_state.input.items,
         .input_cursor = ctx.input.edit_state.cursor,
         .input_summary = geometry.summary,
         .input_window = geometry.window,
