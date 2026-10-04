@@ -23,11 +23,10 @@ const Screen = provider_admin_state.Screen;
 const Step = provider_admin_state.Step;
 
 /// Live wizard data owned by `App`. The wizard state itself is inert until
-/// `wizard.active`; `notice_id` is the pinned prompt notice being replaced in
-/// place, and the edit binding lets a saved edit drop the old stored secret.
+/// `wizard.active`, and the edit binding lets a saved edit drop the old
+/// stored secret.
 pub const State = struct {
     wizard: provider_admin_state.State = .{},
-    notice_id: ?u32 = null,
     edit_binding: ?[32]u8 = null,
     edit_selected: bool = false,
 
@@ -43,7 +42,6 @@ pub const State = struct {
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn beginAdd(app: *App) !void {
-            app.provider_admin.notice_id = null;
             app.provider_admin.edit_binding = null;
             app.provider_admin.edit_selected = false;
             const step = provider_admin_state.beginAdd(&app.provider_admin.wizard);
@@ -57,7 +55,6 @@ pub fn Runtime(comptime App: type) type {
             };
             const binding = definition.binding_identity();
             const stored = definition.auth == .stored and provider_secret_store.present(binding);
-            app.provider_admin.notice_id = null;
             app.provider_admin.edit_binding = binding;
             app.provider_admin.edit_selected = switch (provider_runtime.provider(app)) {
                 .configured => |value| if (value.binding) |active| std.mem.eql(u8, &active, &binding) else false,
@@ -123,18 +120,10 @@ fn respond(app: anytype, step: Step) anyerror!void {
 }
 
 fn showPrompt(app: anytype, invalid: ?[]const u8) !void {
-    var buf: [2048]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const text = promptText(&buf, &app.provider_admin.wizard, invalid);
     const tone: types.NoticeTone = if (invalid != null) .warning else .neutral;
-    const notice = types.SemanticNotice{ .topic = "provider", .tone = tone, .body = text };
-    if (app.provider_admin.notice_id) |id| {
-        if (try app.replaceDomainNotice(id, notice)) {
-            app.shell.render_requests.request(.footer);
-            return;
-        }
-    }
-    app.provider_admin.notice_id = try app.appendReplaceableDomainNotice(notice);
-    app.shell.render_requests.request(.footer);
+    try writeResult(app, text, tone);
 }
 
 fn save(app: anytype, draft_input: provider_management.Draft) !void {
@@ -158,6 +147,9 @@ fn save(app: anytype, draft_input: provider_management.Draft) !void {
             };
             const new_binding = probe.binding_identity();
             if (!std.mem.eql(u8, &old, &new_binding) and !provider_secret_store.present(new_binding)) {
+                // The stored key belongs to the old binding: blank must not
+                // read as "keep it", or the save would loop forever.
+                wizard.has_stored_secret = false;
                 const step = provider_admin_state.revisit(
                     wizard,
                     .secret,
@@ -180,6 +172,7 @@ fn save(app: anytype, draft_input: provider_management.Draft) !void {
         const model = outcome.definition.model_metadata[0].id;
         provider_runtime.replaceSelection(app, provider, model) catch {};
     }
+    provider_admin_state.cancel(&app.provider_admin.wizard);
     var buf: [160]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{s} connection '{s}'.", .{
         if (outcome.action == .add) "Added" else "Updated",
@@ -199,15 +192,7 @@ fn fail(app: anytype, err: anyerror) !void {
 }
 
 fn settleNotice(app: anytype, body: []const u8, tone: types.NoticeTone) !void {
-    const notice = types.SemanticNotice{ .topic = "provider", .tone = tone, .body = body };
-    if (app.provider_admin.notice_id) |id| {
-        if (try app.replaceDomainNotice(id, notice)) {
-            app.provider_admin.notice_id = null;
-            return;
-        }
-    }
-    app.provider_admin.notice_id = null;
-    _ = try app.appendDomainNotice(notice);
+    try writeResult(app, body, tone);
 }
 
 fn writeResult(app: anytype, body: []const u8, tone: types.NoticeTone) !void {
@@ -297,7 +282,7 @@ pub fn promptText(
     invalid: ?[]const u8,
 ) []const u8 {
     const preset = provider_presets.find(state.nameText());
-    var question_buf: [1024]u8 = undefined;
+    var question_buf: [3072]u8 = undefined;
     const question = buildQuestion(&question_buf, state, preset);
     if (invalid) |message| {
         return std.fmt.bufPrint(buf, "{s}. {s}", .{ message, question }) catch blk: {
@@ -317,17 +302,25 @@ fn buildQuestion(
     preset: ?*const provider_presets.Preset,
 ) []const u8 {
     const editing = state.mode == .edit;
+    const keep = "blank keeps, none clears";
     return switch (state.screen) {
         .name => if (editing)
             std.fmt.bufPrint(buf, "Edit connection '{s}': name", .{state.nameText()}) catch "Edit connection: name"
         else
             "Add provider: name",
-        .base_url => if (preset) |value|
+        .base_url => if (editing)
+            std.fmt.bufPrint(buf, "Base URL (current: {s})", .{state.base_url.slice()}) catch "Base URL"
+        else if (preset) |value|
             std.fmt.bufPrint(buf, "Base URL (default: {s})", .{value.base_url}) catch "Base URL"
         else
             "Base URL (required)",
-        .auth => "Auth [none/env/stored] (default: env)",
-        .env => if (preset) |value|
+        .auth => if (editing)
+            std.fmt.bufPrint(buf, "Auth [none/env/stored] (current: {s})", .{authLabel(state.auth)}) catch "Auth [none/env/stored]"
+        else
+            "Auth [none/env/stored] (default: env)",
+        .env => if (editing and state.env.slice().len != 0)
+            std.fmt.bufPrint(buf, "API key environment variable (current: {s})", .{state.env.slice()}) catch "API key environment variable"
+        else if (preset) |value|
             std.fmt.bufPrint(buf, "API key environment variable (default: {s})", .{value.api_key_env}) catch "API key environment variable"
         else
             "API key environment variable (required)",
@@ -335,16 +328,51 @@ fn buildQuestion(
             "API key (hidden; leave blank to keep the stored key)"
         else
             "API key (hidden)",
-        .model => if (preset) |value|
+        .model => if (editing and state.model.slice().len != 0)
+            std.fmt.bufPrint(buf, "Model (current: {s})", .{state.model.slice()}) catch "Model"
+        else if (preset) |value|
             std.fmt.bufPrint(buf, "Model (default: {s})", .{value.models[0].id}) catch "Model"
         else
             "Model (required)",
-        .context_window => "Context window in tokens (optional)",
-        .max_output_tokens => "Max output tokens (optional)",
-        .tool_use => "Tool use [default/yes/no] (default: default)",
-        .vision => "Vision [default/yes/no] (default: default)",
-        .reasoning_efforts => "Reasoning efforts, comma separated (optional)",
+        .context_window => if (editing and state.context_window.slice().len != 0)
+            std.fmt.bufPrint(buf, "Context window in tokens (current: {s}; {s})", .{ state.context_window.slice(), keep }) catch "Context window in tokens (optional)"
+        else
+            "Context window in tokens (optional)",
+        .max_output_tokens => if (editing and state.max_output_tokens.slice().len != 0)
+            std.fmt.bufPrint(buf, "Max output tokens (current: {s}; {s})", .{ state.max_output_tokens.slice(), keep }) catch "Max output tokens (optional)"
+        else
+            "Max output tokens (optional)",
+        .tool_use => if (editing)
+            std.fmt.bufPrint(buf, "Tool use [default/yes/no] (current: {s})", .{triLabel(state.tool_use)}) catch "Tool use [default/yes/no]"
+        else
+            "Tool use [default/yes/no] (default: default)",
+        .vision => if (editing)
+            std.fmt.bufPrint(buf, "Vision [default/yes/no] (current: {s})", .{triLabel(state.vision)}) catch "Vision [default/yes/no]"
+        else
+            "Vision [default/yes/no] (default: default)",
+        .reasoning_efforts => if (editing)
+            std.fmt.bufPrint(buf, "Reasoning efforts, comma separated (current: {s}; none clears)", .{
+                if (state.reasoning_efforts.slice().len == 0) "none" else state.reasoning_efforts.slice(),
+            }) catch "Reasoning efforts, comma separated (optional)"
+        else
+            "Reasoning efforts, comma separated (optional)",
         .confirm => "Save this connection? [yes/no] (default: yes)",
+    };
+}
+
+fn authLabel(auth: provider_admin_state.AuthChoice) []const u8 {
+    return switch (auth) {
+        .none => "none",
+        .env => "env",
+        .stored => "stored",
+    };
+}
+
+fn triLabel(value: provider_admin_state.Tri) []const u8 {
+    return switch (value) {
+        .default => "default",
+        .yes => "yes",
+        .no => "no",
     };
 }
 
@@ -400,7 +428,7 @@ test "provider wizard prompt marks the hidden secret and edit mode" {
     const alloc = std.testing.allocator;
     var registry = try configured_provider.Registry.parse_json(
         alloc,
-        "{\"custom\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"stored\"}}}",
+        "{\"custom\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://example.com/v1\",\"auth\":{\"type\":\"stored\"},\"model_metadata\":{\"fixture-model\":{}}}}",
     );
     defer registry.deinit(alloc);
     _ = provider_admin_state.beginEdit(&state, registry.get("custom").?, true);
@@ -409,10 +437,19 @@ test "provider wizard prompt marks the hidden secret and edit mode" {
         promptText(&buf, &state, null),
     );
     _ = provider_admin_state.commit(&state, "custom");
+    try std.testing.expectEqualStrings(
+        "Base URL (current: https://example.com/v1)",
+        promptText(&buf, &state, null),
+    );
     _ = provider_admin_state.commit(&state, "https://example.com/v1");
     _ = provider_admin_state.commit(&state, "stored");
     try std.testing.expectEqualStrings(
         "API key (hidden; leave blank to keep the stored key)",
+        promptText(&buf, &state, null),
+    );
+    _ = provider_admin_state.commit(&state, "");
+    try std.testing.expectEqualStrings(
+        "Model (current: fixture-model)",
         promptText(&buf, &state, null),
     );
 }

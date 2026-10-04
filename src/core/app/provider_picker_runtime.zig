@@ -342,7 +342,7 @@ pub fn Runtime(comptime App: type) type {
                             return true;
                         },
                         .manage_connections => {
-                            openManage(app);
+                            try enterManageStage(app, query.prefix, "", .manage);
                             return true;
                         },
                     }
@@ -441,8 +441,7 @@ pub fn Runtime(comptime App: type) type {
                         return true;
                     }
                     const definition = configuredDefinition(app, selected) orelse return false;
-                    try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, definition.id, "", .manage_actions);
-                    app.shell.render_requests.request(.footer);
+                    try enterManageStage(app, query.prefix, definition.id, .manage_actions);
                     return true;
                 },
                 .manage_actions => {
@@ -454,11 +453,11 @@ pub fn Runtime(comptime App: type) type {
                         return true;
                     }
                     if (std.mem.eql(u8, selected, provider_picker_catalog.manage_remove_label)) {
-                        setManageStage(app, .manage_confirm);
+                        try enterManageStage(app, query.prefix, name, .manage_confirm);
                         return true;
                     }
                     if (std.mem.eql(u8, selected, provider_picker_catalog.manage_back_label)) {
-                        setManageStage(app, .manage);
+                        try enterManageStage(app, query.prefix, name, .manage);
                         return true;
                     }
                     return false;
@@ -472,7 +471,7 @@ pub fn Runtime(comptime App: type) type {
                         return true;
                     }
                     if (std.mem.eql(u8, selected, provider_picker_catalog.manage_cancel_label)) {
-                        setManageStage(app, .manage_actions);
+                        try enterManageStage(app, query.prefix, name, .manage_actions);
                         return true;
                     }
                     return false;
@@ -485,14 +484,18 @@ pub fn Runtime(comptime App: type) type {
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
         }
 
-        fn openManage(app: *App) void {
-            setManageStage(app, .manage);
-        }
-
-        fn setManageStage(app: *App, stage: ProviderPickerStage) void {
-            app.input_runtime.picker.provider_picker_stage = stage;
-            app.input_runtime.picker.manage_column_index = 0;
-            app.input_runtime.picker.manage_column_window_start = 0;
+        /// Rewrites the composer back to the bare command prefix so the new
+        /// manage screen is unfiltered, then re-establishes the stage with the
+        /// connection it refines. A full composer replacement clears the
+        /// picker flow, so the order matters.
+        fn enterManageStage(
+            app: *App,
+            prefix: []const u8,
+            pending_name: []const u8,
+            stage: ProviderPickerStage,
+        ) !void {
+            try setComposerText(app, "{s}", .{prefix});
+            try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, pending_name, "", stage);
             app.shell.render_requests.request(.footer);
         }
 
@@ -534,14 +537,12 @@ pub fn Runtime(comptime App: type) type {
                     picker.clearProviderPickerFlow();
                 },
                 .manage_actions => {
-                    picker.provider_picker_stage = .manage;
-                    picker.manage_column_index = 0;
-                    picker.manage_column_window_start = 0;
+                    try enterManageStage(app, query.prefix, picker.provider_picker_pending_provider.items, .manage);
+                    return true;
                 },
                 .manage_confirm => {
-                    picker.provider_picker_stage = .manage_actions;
-                    picker.manage_column_index = 0;
-                    picker.manage_column_window_start = 0;
+                    try enterManageStage(app, query.prefix, picker.provider_picker_pending_provider.items, .manage_actions);
+                    return true;
                 },
                 .method => {
                     // Back to the full provider column, not to the committed

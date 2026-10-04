@@ -162,17 +162,20 @@ pub fn commit(state: *State, value: []const u8) Step {
     const trimmed = std.mem.trim(u8, value, " \t");
     switch (state.screen) {
         .name => {
-            if (trimmed.len == 0) return invalid(state, "Provider name is required");
-            if (state.mode == .edit and !std.mem.eql(u8, trimmed, state.original_name.slice())) {
-                return invalid(state, "Provider names cannot be changed; cancel and add a new connection");
+            if (trimmed.len == 0) {
+                if (state.mode == .add) return invalid(state, "Provider name is required");
+            } else {
+                if (state.mode == .edit and !std.mem.eql(u8, trimmed, state.original_name.slice())) {
+                    return invalid(state, "Provider names cannot be changed; cancel and add a new connection");
+                }
+                configured_provider.validate_id(trimmed) catch |err| return invalid(state, idMessage(err));
+                state.name.set(trimmed);
             }
-            configured_provider.validate_id(trimmed) catch |err| return invalid(state, idMessage(err));
-            state.name.set(trimmed);
             state.screen = .base_url;
             return .{ .prompt = .base_url };
         },
         .base_url => {
-            state.base_url.set(trimmed);
+            if (!(state.mode == .edit and trimmed.len == 0)) state.base_url.set(trimmed);
             state.screen = .auth;
             return .{ .prompt = .auth };
         },
@@ -189,7 +192,7 @@ pub fn commit(state: *State, value: []const u8) Step {
             return .{ .prompt = state.screen };
         },
         .env => {
-            state.env.set(trimmed);
+            if (!(state.mode == .edit and trimmed.len == 0)) state.env.set(trimmed);
             state.screen = .model;
             return .{ .prompt = .model };
         },
@@ -205,25 +208,33 @@ pub fn commit(state: *State, value: []const u8) Step {
             return .{ .prompt = .model };
         },
         .model => {
-            state.model.set(trimmed);
+            if (!(state.mode == .edit and trimmed.len == 0)) state.model.set(trimmed);
             state.screen = .context_window;
             return .{ .prompt = .context_window };
         },
         .context_window => {
-            if (trimmed.len != 0) {
+            if (trimmed.len == 0) {
+                if (state.mode == .add) state.context_window.clear();
+            } else if (std.ascii.eqlIgnoreCase(trimmed, "none")) {
+                state.context_window.clear();
+            } else {
                 const parsed = parsePositive(trimmed) orelse
                     return invalid(state, "Context window must be a positive integer");
                 state.context_window.setInt(parsed);
-            } else state.context_window.clear();
+            }
             state.screen = .max_output_tokens;
             return .{ .prompt = .max_output_tokens };
         },
         .max_output_tokens => {
-            if (trimmed.len != 0) {
+            if (trimmed.len == 0) {
+                if (state.mode == .add) state.max_output_tokens.clear();
+            } else if (std.ascii.eqlIgnoreCase(trimmed, "none")) {
+                state.max_output_tokens.clear();
+            } else {
                 const parsed = parsePositive(trimmed) orelse
                     return invalid(state, "Max output tokens must be a positive integer");
                 state.max_output_tokens.setInt(parsed);
-            } else state.max_output_tokens.clear();
+            }
             state.screen = .tool_use;
             return .{ .prompt = .tool_use };
         },
@@ -244,12 +255,16 @@ pub fn commit(state: *State, value: []const u8) Step {
             return .{ .prompt = .reasoning_efforts };
         },
         .reasoning_efforts => {
-            if (trimmed.len != 0 and !std.ascii.eqlIgnoreCase(trimmed, "none") and
-                !provider_management.effortsValid(trimmed))
-            {
-                return invalid(state, "Reasoning efforts must be comma-separated names such as low, high");
+            if (trimmed.len == 0) {
+                if (state.mode == .add) state.reasoning_efforts.clear();
+            } else if (std.ascii.eqlIgnoreCase(trimmed, "none")) {
+                state.reasoning_efforts.clear();
+            } else {
+                if (!provider_management.effortsValid(trimmed)) {
+                    return invalid(state, "Reasoning efforts must be comma-separated names such as low, high");
+                }
+                state.reasoning_efforts.set(trimmed);
             }
-            state.reasoning_efforts.set(trimmed);
             state.screen = .confirm;
             return .{ .prompt = .confirm };
         },
@@ -469,20 +484,53 @@ test "provider setup wizard edit prefills every field and rejects renames" {
         "Provider names cannot be changed; cancel and add a new connection",
         commit(&state, "other").invalid.message,
     );
+    // Every empty answer keeps the prefilled value in edit mode.
     try std.testing.expectEqual(Screen.base_url, commit(&state, "deepseek").prompt);
-    try std.testing.expectEqual(Screen.auth, commit(&state, "https://api.deepseek.com").prompt);
+    try std.testing.expectEqual(Screen.auth, commit(&state, "").prompt);
+    try std.testing.expectEqualStrings("https://api.deepseek.com", state.base_url.slice());
     try std.testing.expectEqual(Screen.secret, commit(&state, "").prompt);
     try std.testing.expectEqual(Screen.model, commit(&state, "").prompt);
+    try std.testing.expectEqual(Screen.context_window, commit(&state, "").prompt);
+    try std.testing.expectEqualStrings("deepseek-flash", state.model.slice());
+    try std.testing.expectEqual(Screen.max_output_tokens, commit(&state, "").prompt);
+    try std.testing.expectEqualStrings("64000", state.context_window.slice());
+    try std.testing.expectEqual(Screen.tool_use, commit(&state, "").prompt);
+    try std.testing.expectEqual(Screen.vision, commit(&state, "").prompt);
+    try std.testing.expectEqual(Screen.reasoning_efforts, commit(&state, "").prompt);
+    try std.testing.expectEqual(Screen.confirm, commit(&state, "").prompt);
+    try std.testing.expectEqualStrings("low, high", state.reasoning_efforts.slice());
 
-    // Empty secret on the model path keeps the stored key.
-    _ = commit(&state, "");
-    _ = commit(&state, "");
-    _ = commit(&state, "");
-    _ = commit(&state, "");
-    _ = commit(&state, "");
-    _ = commit(&state, "");
     const draft = commit(&state, "yes").saved;
     try std.testing.expect(draft.save_api_key);
+    try std.testing.expectEqual(@as(?u32, 64000), draft.context_window);
+    try std.testing.expect(draft.tool_use);
+    try std.testing.expectEqualStrings("low, high", draft.reasoning_efforts_raw.?);
+}
+
+test "provider setup wizard edit clears optional values with none" {
+    const alloc = std.testing.allocator;
+    var registry = try configured_provider.Registry.parse_json(
+        alloc,
+        "{\"deepseek\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"https://api.deepseek.com\",\"auth\":{\"type\":\"none\"},\"model_metadata\":{\"deepseek-flash\":{\"context_window\":64000,\"max_output_tokens\":8192,\"reasoning_efforts\":[\"low\"]}}}}",
+    );
+    defer registry.deinit(alloc);
+    var state: State = .{};
+    _ = beginEdit(&state, registry.get("deepseek").?, false);
+    _ = commit(&state, "");
+    _ = commit(&state, "");
+    _ = commit(&state, "none");
+    _ = commit(&state, "");
+    try std.testing.expectEqual(Screen.context_window, state.screen);
+    _ = commit(&state, "none");
+    _ = commit(&state, "none");
+    _ = commit(&state, "");
+    _ = commit(&state, "");
+    _ = commit(&state, "none");
+    const draft = commit(&state, "yes").saved;
+    try std.testing.expect(draft.context_window == null);
+    try std.testing.expect(draft.max_output_tokens == null);
+    try std.testing.expect(draft.reasoning_efforts_raw == null);
+    try std.testing.expectEqualStrings("deepseek-flash", draft.model.?);
 }
 
 test "provider setup wizard confirm can cancel and revisit keeps answers" {
