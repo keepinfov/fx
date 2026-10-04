@@ -42,67 +42,77 @@ pub const State = struct {
 pub fn Runtime(comptime App: type) type {
     return struct {
         pub fn beginAdd(app: *App) !void {
-            app.provider_admin.edit_binding = null;
-            app.provider_admin.edit_selected = false;
-            const step = provider_admin_state.beginAdd(&app.provider_admin.wizard);
-            try respond(app, step);
+            if (comptime @hasField(App, "provider_admin")) {
+                app.provider_admin.edit_binding = null;
+                app.provider_admin.edit_selected = false;
+                const step = provider_admin_state.beginAdd(&app.provider_admin.wizard);
+                try respond(app, step);
+            }
         }
 
         pub fn beginEdit(app: *App, name: []const u8) !void {
-            const definition = findDefinition(app, name) orelse {
-                try writeResult(app, "That connection is no longer configured.", .warning);
-                return;
-            };
-            const binding = definition.binding_identity();
-            const stored = definition.auth == .stored and provider_secret_store.present(binding);
-            app.provider_admin.edit_binding = binding;
-            app.provider_admin.edit_selected = switch (provider_runtime.provider(app)) {
-                .configured => |value| if (value.binding) |active| std.mem.eql(u8, &active, &binding) else false,
-                else => false,
-            };
-            const step = provider_admin_state.beginEdit(&app.provider_admin.wizard, definition, stored);
-            try respond(app, step);
+            if (comptime @hasField(App, "provider_admin")) {
+                const definition = findDefinition(app, name) orelse {
+                    try writeResult(app, "That connection is no longer configured.", .warning);
+                    return;
+                };
+                const binding = definition.binding_identity();
+                const stored = definition.auth == .stored and provider_secret_store.present(binding);
+                app.provider_admin.edit_binding = binding;
+                app.provider_admin.edit_selected = switch (provider_runtime.provider(app)) {
+                    .configured => |value| if (value.binding) |active| std.mem.eql(u8, &active, &binding) else false,
+                    else => false,
+                };
+                const step = provider_admin_state.beginEdit(&app.provider_admin.wizard, definition, stored);
+                try respond(app, step);
+            }
         }
 
         /// Enter with the wizard active: the composer content is the answer.
         pub fn submit(app: *App) !void {
-            if (!app.provider_admin.wizard.active) return;
-            const value = try app.alloc.dupe(u8, app.input_runtime.edit_state.input.items);
-            defer app.alloc.free(value);
-            _ = app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            const step = provider_admin_state.commit(&app.provider_admin.wizard, value);
-            try respond(app, step);
+            if (comptime @hasField(App, "provider_admin")) {
+                if (!app.provider_admin.wizard.active) return;
+                const value = try app.alloc.dupe(u8, app.input_runtime.edit_state.input.items);
+                defer app.alloc.free(value);
+                _ = app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                const step = provider_admin_state.commit(&app.provider_admin.wizard, value);
+                try respond(app, step);
+            }
         }
 
         pub fn cancel(app: *App) !void {
-            if (!app.provider_admin.wizard.active) return;
-            provider_admin_state.cancel(&app.provider_admin.wizard);
-            try settleNotice(app, "Provider setup cancelled.", .cancelled);
-            app.shell.render_requests.request(.footer);
+            if (comptime @hasField(App, "provider_admin")) {
+                if (!app.provider_admin.wizard.active) return;
+                provider_admin_state.cancel(&app.provider_admin.wizard);
+                try settleNotice(app, "Provider setup cancelled.", .cancelled);
+                app.shell.render_requests.request(.footer);
+            }
         }
 
         /// Removes a configured connection from the manage column and drops its
         /// stored secret. Removing the active connection falls back to Vercel.
         pub fn remove(app: *App, name: []const u8) !void {
-            const active_binding: ?[32]u8 = switch (provider_runtime.provider(app)) {
-                .configured => |value| value.binding,
-                else => null,
-            };
-            const outcome = provider_management.applyRemove(app.alloc, name) catch |err| {
-                try writeResult(app, removeFailureMessage(err), .warning);
-                return;
-            };
-            reloadDefinitions(app);
-            if (active_binding) |binding| {
-                if (std.mem.eql(u8, &binding, &outcome.binding)) {
-                    const fallback = gatewayModel(app);
-                    provider_runtime.replaceSelection(app, .gateway, fallback) catch {};
+            if (comptime @hasField(App, "provider_admin")) {
+                const active_binding: ?[32]u8 = switch (provider_runtime.provider(app)) {
+                    .configured => |value| value.binding,
+                    else => null,
+                };
+                const outcome = provider_management.applyRemove(app.alloc, name) catch |err| {
+                    try writeResult(app, removeFailureMessage(err), .warning);
+                    return;
+                };
+                reloadDefinitions(app);
+                if (active_binding) |binding| {
+                    if (std.mem.eql(u8, &binding, &outcome.binding)) {
+                        const fallback = gatewayModel(app);
+                        provider_runtime.replaceSelection(app, .gateway, fallback) catch {};
+                    }
                 }
+                var buf: [160]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "Removed connection '{s}'.", .{name}) catch "Removed connection.";
+                try writeResult(app, text, .neutral);
+                app.shell.render_requests.request(.footer);
             }
-            var buf: [160]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "Removed connection '{s}'.", .{name}) catch "Removed connection.";
-            try writeResult(app, text, .neutral);
-            app.shell.render_requests.request(.footer);
         }
     };
 }
