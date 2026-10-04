@@ -77,6 +77,8 @@ fx provider remove deepseek
 
 `add` writes the connection to `~/.fx/settings.json`, saves the selected model, and switches the profile to it. Known presets such as `deepseek` prefill the endpoint, API key environment variable, model, context window, tool support, and reasoning efforts. Pass `--save-api-key` to store the key under `~/.fx/provider-credentials/` (0600) instead of reading an environment variable, `--no-select` to define a connection without switching to it, and `--reasoning-efforts low,high,max` to advertise `reasoning_effort` values for endpoints that support them.
 
+The `/provider` picker lists saved connections beside the builtin providers and adds `add connection…` and `manage connections…` rows. The wizard walks through the connection name, endpoint, auth, model, and metadata, writes the same settings as the CLI, and masks the API key while it is typed. `manage connections…` edits or removes saved connections without leaving the session; removing the active connection falls back to Vercel.
+
 Connections remain plain JSON and can still be hand-edited or committed. Select one for a single invocation with environment variables:
 
 ```bash

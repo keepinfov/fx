@@ -15,11 +15,13 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const provider_picker_catalog = @import("../auth/provider_picker_catalog.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
 const picker_state = @import("../input/picker_state.zig");
 const list_window = @import("../shared/list_window.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
+const app_provider_admin_runtime = @import("app_provider_admin_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 
 const ProviderPickerStage = picker_state.ProviderPickerStage;
@@ -72,14 +74,56 @@ pub fn Runtime(comptime App: type) type {
             var count: usize = 0;
             switch (query.stage) {
                 .provider => {
-                    var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-                    count = provider_picker_catalog.providerOptions(&slugs);
-                    for (slugs[0..count], 0..) |slug, i| {
-                        column.labels[i] = slug;
-                        const id = provider_catalog.parse(slug) orelse .gateway;
-                        column.annotations[i] = if (id.eql(active_provider) and
-                            model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
+                    var options: [provider_picker_catalog.max_provider_options]provider_picker_catalog.ProviderOption = undefined;
+                    count = provider_picker_catalog.providerOptions(definitions(app), &options);
+                    for (options[0..count], 0..) |option, i| {
+                        column.labels[i] = provider_picker_catalog.optionLabel(option);
+                        column.annotations[i] = switch (option) {
+                            .catalog => |id| if (id.eql(active_provider) and
+                                model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "",
+                            .configured => |name| if (configuredDefinition(app, name)) |definition|
+                                if (configuredCurrent(app, definition)) "current" else ""
+                            else
+                                "",
+                            .add_connection, .manage_connections => "",
+                        };
                     }
+                },
+                .manage => {
+                    for (definitions(app)) |*definition| {
+                        if (count >= max_options) break;
+                        column.labels[count] = definition.id;
+                        column.annotations[count] = if (configuredCurrent(app, definition)) "current" else "";
+                        count += 1;
+                    }
+                    if (count < max_options) {
+                        column.labels[count] = provider_picker_catalog.manage_back_label;
+                        column.annotations[count] = "";
+                        count += 1;
+                    }
+                },
+                .manage_actions => {
+                    const labels = [_][]const u8{
+                        provider_picker_catalog.manage_edit_label,
+                        provider_picker_catalog.manage_remove_label,
+                        provider_picker_catalog.manage_back_label,
+                    };
+                    for (labels, 0..) |label, i| {
+                        column.labels[i] = label;
+                        column.annotations[i] = "";
+                    }
+                    count = labels.len;
+                },
+                .manage_confirm => {
+                    const labels = [_][]const u8{
+                        provider_picker_catalog.manage_remove_label,
+                        provider_picker_catalog.manage_cancel_label,
+                    };
+                    for (labels, 0..) |label, i| {
+                        column.labels[i] = label;
+                        column.annotations[i] = "";
+                    }
+                    count = labels.len;
                 },
                 .method => {
                     const pending = app.input_runtime.picker.provider_picker_pending_provider.items;
@@ -173,6 +217,7 @@ pub fn Runtime(comptime App: type) type {
                 .method => list_window.advanceSelection(&picker.method_column_index, &picker.method_column_window_start, count, delta),
                 .team => list_window.advanceSelection(&picker.team_column_index, &picker.team_column_window_start, count, delta),
                 .key_source => list_window.advanceSelection(&picker.key_source_column_index, &picker.key_source_column_window_start, count, delta),
+                .manage, .manage_actions, .manage_confirm => list_window.advanceSelection(&picker.manage_column_index, &picker.manage_column_window_start, count, delta),
                 .api_key => {},
             }
         }
@@ -187,9 +232,17 @@ pub fn Runtime(comptime App: type) type {
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return;
             const stage = query.stage;
             if (stage == .api_key) return;
+            if (stage == .manage or stage == .manage_actions or stage == .manage_confirm) return;
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
             const selected = selectedLabel(app, query, &column) orelse return;
+            if (stage == .provider) {
+                const option = provider_picker_catalog.optionForLabel(definitions(app), selected) orelse return;
+                switch (option) {
+                    .catalog, .configured => {},
+                    .add_connection, .manage_connections => return,
+                }
+            }
 
             const picker = &app.input_runtime.picker;
             const prefix = try app.alloc.dupe(u8, query.prefix);
@@ -210,6 +263,7 @@ pub fn Runtime(comptime App: type) type {
                     try picker.beginProviderPickerFlow(app.alloc, provider_slug, method_slug, stage);
                 },
                 .api_key => unreachable,
+                .manage, .manage_actions, .manage_confirm => return,
             }
             app.shell.render_requests.request(.footer);
         }
@@ -232,13 +286,17 @@ pub fn Runtime(comptime App: type) type {
             const selected = exactLabel(query.query, &column) orelse return false;
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
-                    if (provider_picker_catalog.providerMethods(provider).len == 0) return false;
+                    const option = provider_picker_catalog.optionForLabel(definitions(app), selected) orelse return false;
+                    const id = switch (option) {
+                        .catalog => |value| value,
+                        else => return false,
+                    };
+                    if (provider_picker_catalog.providerMethods(id).len == 0) return false;
                 },
                 .method => {
                     if (provider_picker_catalog.parseMethod(selected) != .api_key) return false;
                 },
-                .team, .key_source, .api_key => return false,
+                .team, .key_source, .api_key, .manage, .manage_actions, .manage_confirm => return false,
             }
             return try submit(app);
         }
@@ -258,18 +316,36 @@ pub fn Runtime(comptime App: type) type {
 
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
-                    if (provider_picker_catalog.providerMethods(provider).len == 0) {
-                        try commit(app, .{ .provider = provider });
-                        return true;
+                    const option = provider_picker_catalog.optionForLabel(definitions(app), selected) orelse return false;
+                    switch (option) {
+                        .catalog => |id| {
+                            if (provider_picker_catalog.providerMethods(id).len == 0) {
+                                try commit(app, .{ .provider = id });
+                                return true;
+                            }
+                            // Nothing is applied yet: the provider is only a heading
+                            // until the method, and then the team, are chosen too.
+                            const slug = provider_catalog.find(id).slug;
+                            try setComposerText(app, "{s}{s} ", .{ query.prefix, slug });
+                            try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, slug, "", .method);
+                            app.shell.render_requests.request(.footer);
+                            return true;
+                        },
+                        .configured => |name| {
+                            const provider = model_provider.parse(name) orelse return false;
+                            try commit(app, .{ .provider = provider });
+                            return true;
+                        },
+                        .add_connection => {
+                            try closePicker(app);
+                            try app_provider_admin_runtime.Runtime(App).beginAdd(app);
+                            return true;
+                        },
+                        .manage_connections => {
+                            try enterManageStage(app, query.prefix, "", .manage);
+                            return true;
+                        },
                     }
-                    // Nothing is applied yet: the provider is only a heading
-                    // until the method, and then the team, are chosen too.
-                    const slug = provider_catalog.find(provider).slug;
-                    try setComposerText(app, "{s}{s} ", .{ query.prefix, slug });
-                    try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, slug, "", .method);
-                    app.shell.render_requests.request(.footer);
-                    return true;
                 },
                 .method => {
                     const method = provider_picker_catalog.parseMethod(selected) orelse return false;
@@ -279,7 +355,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.auth.refreshSourceInventory(app.alloc);
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
-                    ) orelse .gateway;
+                    ) orelse return false;
                     if (method == .api_key) {
                         // With detected keys the next column asks which to use
                         // (or `new` to paste one); with none there is nothing
@@ -339,7 +415,7 @@ pub fn Runtime(comptime App: type) type {
                     const key_source = provider_picker_catalog.parseKeySource(selected) orelse return false;
                     const pending_provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
-                    ) orelse .gateway;
+                    ) orelse return false;
                     if (provider_picker_catalog.keySourceCredential(key_source)) |credential| {
                         try commitSource(app, credential, pending_provider);
                     } else {
@@ -354,11 +430,73 @@ pub fn Runtime(comptime App: type) type {
                     const index = teamIndex(app, selected) orelse return false;
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
-                    ) orelse .gateway;
+                    ) orelse return false;
                     try commitTeam(app, index, provider);
                     return true;
                 },
+                .manage => {
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.manage_back_label)) {
+                        app.input_runtime.picker.clearProviderPickerFlow();
+                        app.shell.render_requests.request(.footer);
+                        return true;
+                    }
+                    const definition = configuredDefinition(app, selected) orelse return false;
+                    try enterManageStage(app, query.prefix, definition.id, .manage_actions);
+                    return true;
+                },
+                .manage_actions => {
+                    const name = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
+                    defer app.alloc.free(name);
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.manage_edit_label)) {
+                        try closePicker(app);
+                        try app_provider_admin_runtime.Runtime(App).beginEdit(app, name);
+                        return true;
+                    }
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.manage_remove_label)) {
+                        try enterManageStage(app, query.prefix, name, .manage_confirm);
+                        return true;
+                    }
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.manage_back_label)) {
+                        try enterManageStage(app, query.prefix, name, .manage);
+                        return true;
+                    }
+                    return false;
+                },
+                .manage_confirm => {
+                    const name = try app.alloc.dupe(u8, app.input_runtime.picker.provider_picker_pending_provider.items);
+                    defer app.alloc.free(name);
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.manage_remove_label)) {
+                        try closePicker(app);
+                        try app_provider_admin_runtime.Runtime(App).remove(app, name);
+                        return true;
+                    }
+                    if (std.mem.eql(u8, selected, provider_picker_catalog.manage_cancel_label)) {
+                        try enterManageStage(app, query.prefix, name, .manage_actions);
+                        return true;
+                    }
+                    return false;
+                },
             }
+        }
+
+        fn closePicker(app: *App) !void {
+            app.input_runtime.picker.clearProviderPickerFlow();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+        }
+
+        /// Rewrites the composer back to the bare command prefix so the new
+        /// manage screen is unfiltered, then re-establishes the stage with the
+        /// connection it refines. A full composer replacement clears the
+        /// picker flow, so the order matters.
+        fn enterManageStage(
+            app: *App,
+            prefix: []const u8,
+            pending_name: []const u8,
+            stage: ProviderPickerStage,
+        ) !void {
+            try setComposerText(app, "{s}", .{prefix});
+            try app.input_runtime.picker.beginProviderPickerFlow(app.alloc, pending_name, "", stage);
+            app.shell.render_requests.request(.footer);
         }
 
         /// Opens one of the api-key stages under the `api-key` argument: the
@@ -395,6 +533,17 @@ pub fn Runtime(comptime App: type) type {
                 // Arrow keys never reach here while the key field is active;
                 // its entry routing consumes them. Esc is the way out.
                 .api_key => return false,
+                .manage => {
+                    picker.clearProviderPickerFlow();
+                },
+                .manage_actions => {
+                    try enterManageStage(app, query.prefix, picker.provider_picker_pending_provider.items, .manage);
+                    return true;
+                },
+                .manage_confirm => {
+                    try enterManageStage(app, query.prefix, picker.provider_picker_pending_provider.items, .manage_actions);
+                    return true;
+                },
                 .method => {
                     // Back to the full provider column, not to the committed
                     // token as a filter: the point of stepping back is seeing
@@ -418,7 +567,12 @@ pub fn Runtime(comptime App: type) type {
         pub fn abandon(app: *App) void {
             if (comptime !supported(App)) return;
             app.auth.releaseLoadedTeamSelection(app.alloc);
-            if (app.input_runtime.picker.provider_picker_stage == .provider) return;
+            const stage = app.input_runtime.picker.provider_picker_stage;
+            if (stage == .provider) return;
+            if (stage == .manage or stage == .manage_actions or stage == .manage_confirm) {
+                app.input_runtime.picker.clearProviderPickerFlow();
+                return;
+            }
             app.auth.cancelInlineApiKeyEntry(app.alloc);
             app.input_runtime.picker.clearProviderPickerFlow();
         }
@@ -508,6 +662,7 @@ pub fn Runtime(comptime App: type) type {
                 .method => picker.method_column_index,
                 .team => picker.team_column_index,
                 .key_source => picker.key_source_column_index,
+                .manage, .manage_actions, .manage_confirm => picker.manage_column_index,
                 .api_key => 0,
             };
         }
@@ -550,9 +705,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn syncProviderSelection(app: *App, slug: []const u8) void {
-            var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-            const count = provider_picker_catalog.providerOptions(&slugs);
-            for (slugs[0..count], 0..) |candidate, index| {
+            var options: [provider_picker_catalog.max_provider_options]provider_picker_catalog.ProviderOption = undefined;
+            const count = provider_picker_catalog.providerOptions(definitions(app), &options);
+            for (options[0..count], 0..) |option, index| {
+                const candidate = provider_picker_catalog.optionLabel(option);
                 if (!std.mem.eql(u8, candidate, slug)) continue;
                 app.input_runtime.picker.provider_column_index = index;
                 app.input_runtime.picker.provider_column_window_start = list_window.updateEdgeStart(
@@ -571,6 +727,38 @@ pub fn Runtime(comptime App: type) type {
             try app.input_runtime.textReplacementState().replace(app.alloc, text);
         }
     };
+}
+
+fn definitions(app: anytype) []const configured_provider.Definition {
+    const App = @TypeOf(app.*);
+    if (comptime @hasField(App, "provider_selection")) return app.provider_selection.definitions.definitions;
+    return &.{};
+}
+
+fn configuredDefinition(app: anytype, name: []const u8) ?*const configured_provider.Definition {
+    for (definitions(app)) |*definition| {
+        if (std.mem.eql(u8, definition.id, name)) return definition;
+    }
+    return null;
+}
+
+fn activeConfiguredBinding(app: anytype) ?[32]u8 {
+    const App = @TypeOf(app.*);
+    if (comptime @hasField(App, "provider_selection")) {
+        return switch (provider_runtime.provider(app)) {
+            .configured => |value| value.binding,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// True when `definition` is the connection currently doing inference, which
+/// requires the active binding to match, not just the name.
+fn configuredCurrent(app: anytype, definition: *const configured_provider.Definition) bool {
+    const active = activeConfiguredBinding(app) orelse return false;
+    const binding = definition.binding_identity();
+    return std.mem.eql(u8, &active, &binding);
 }
 
 fn exactLabel(raw_query: []const u8, column: *const ColumnBuffer) ?[]const u8 {
@@ -594,12 +782,22 @@ test "exact label matching ignores case and surrounding spaces" {
 }
 
 test "model provider identity stays aligned with the catalog slugs" {
-    var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-    const count = provider_picker_catalog.providerOptions(&slugs);
-    for (slugs[0..count]) |slug| {
-        const id: model_provider.ProviderId = provider_catalog.parse(slug).?;
-        try std.testing.expectEqualStrings(slug, provider_catalog.find(id).slug);
+    var options: [provider_picker_catalog.max_provider_options]provider_picker_catalog.ProviderOption = undefined;
+    const count = provider_picker_catalog.providerOptions(&.{}, &options);
+    var saw_catalog = false;
+    for (options[0..count]) |option| {
+        switch (option) {
+            .catalog => |id| {
+                saw_catalog = true;
+                try std.testing.expectEqualStrings(
+                    provider_catalog.find(id).slug,
+                    provider_picker_catalog.optionLabel(option),
+                );
+            },
+            else => {},
+        }
     }
+    try std.testing.expect(saw_catalog);
 }
 
 const core_input_runtime = @import("../input/runtime.zig");
@@ -716,6 +914,61 @@ test "provider column narrows to what was typed" {
     try std.testing.expectEqualStrings("grok", column.labels[0]);
 }
 
+test "provider column lists saved connections and management rows" {
+    const alloc = std.testing.allocator;
+    var app = ColumnTestApp.init(alloc);
+    defer app.deinit();
+    app.provider_selection.definitions = try configured_provider.Registry.parse_json(
+        alloc,
+        "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:1234/v1\",\"auth\":{\"type\":\"none\"}}}",
+    );
+    const definition = app.provider_selection.definitions.get("local").?;
+    app.provider_selection.active_provider = try (model_provider.parse("local").?).bind(app.provider_selection.definitions);
+
+    const column = columnFor(&app, .provider, "");
+    var saw_configured = false;
+    var saw_add = false;
+    var saw_manage = false;
+    for (column.labels[0..column.count], column.annotations[0..column.count]) |label, annotation| {
+        if (std.mem.eql(u8, label, "local")) {
+            saw_configured = true;
+            try std.testing.expectEqualStrings("current", annotation);
+        }
+        if (std.mem.eql(u8, label, provider_picker_catalog.add_connection_label)) saw_add = true;
+        if (std.mem.eql(u8, label, provider_picker_catalog.manage_connections_label)) saw_manage = true;
+    }
+    try std.testing.expect(saw_configured and saw_add and saw_manage);
+    try std.testing.expect(definition.binding_identity().len == 32);
+}
+
+test "manage columns list connections and their actions" {
+    const alloc = std.testing.allocator;
+    var app = ColumnTestApp.init(alloc);
+    defer app.deinit();
+    app.provider_selection.definitions = try configured_provider.Registry.parse_json(
+        alloc,
+        "{\"alpha\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://127.0.0.1:1234/v1\",\"auth\":{\"type\":\"none\"}}}",
+    );
+    app.provider_selection.active_provider = try (model_provider.parse("alpha").?).bind(app.provider_selection.definitions);
+
+    const manage = columnFor(&app, .manage, "");
+    try std.testing.expectEqual(@as(usize, 2), manage.count);
+    try std.testing.expectEqualStrings("alpha", manage.labels[0]);
+    try std.testing.expectEqualStrings("current", manage.annotations[0]);
+    try std.testing.expectEqualStrings(provider_picker_catalog.manage_back_label, manage.labels[1]);
+    try std.testing.expectEqual(@as(usize, 1), columnFor(&app, .manage, "alph").count);
+
+    const actions = columnFor(&app, .manage_actions, "");
+    try std.testing.expectEqual(@as(usize, 3), actions.count);
+    try std.testing.expectEqualStrings(provider_picker_catalog.manage_edit_label, actions.labels[0]);
+    try std.testing.expectEqualStrings(provider_picker_catalog.manage_remove_label, actions.labels[1]);
+
+    const confirm = columnFor(&app, .manage_confirm, "");
+    try std.testing.expectEqual(@as(usize, 2), confirm.count);
+    try std.testing.expectEqualStrings(provider_picker_catalog.manage_remove_label, confirm.labels[0]);
+    try std.testing.expectEqualStrings(provider_picker_catalog.manage_cancel_label, confirm.labels[1]);
+}
+
 test "provider picker loading preserves query and selection instead of exposing cached options" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
@@ -734,8 +987,10 @@ test "provider picker loading preserves query and selection instead of exposing 
 
     app.auth.inventory_refresh_active = false;
     const ready = columnFor(&app, .provider, "co");
-    try std.testing.expectEqual(@as(usize, 1), ready.count);
+    // `co` now also matches `add connection…`.
+    try std.testing.expectEqual(@as(usize, 2), ready.count);
     try std.testing.expectEqualStrings("codex", ready.labels[0]);
+    try std.testing.expectEqualStrings(provider_picker_catalog.add_connection_label, ready.labels[1]);
     try Runtime(ColumnTestApp).autocomplete(&app);
     try std.testing.expectEqualStrings("/provider codex", app.input_runtime.edit_state.input.items);
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
+const app_provider_admin_runtime = @import("app_provider_admin_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
@@ -1555,6 +1556,12 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (comptime @hasField(App, "provider_admin")) {
+                        if (app.provider_admin.wizard.active) {
+                            try app_provider_admin_runtime.Runtime(App).submit(app);
+                            return;
+                        }
+                    }
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
@@ -3115,6 +3122,13 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn resolveEscape(app: *App, was_cancel_pending: bool, now: i64) !void {
+            if (comptime @hasField(App, "provider_admin")) {
+                if (app.provider_admin.wizard.active) {
+                    try app_provider_admin_runtime.Runtime(App).cancel(app);
+                    _ = disarmEscapeClear(app);
+                    return;
+                }
+            }
             if (try full_transcript_rt.routeAction(app, .escape)) return;
             if (was_cancel_pending) {
                 if (app.question_prompt.isActive()) {

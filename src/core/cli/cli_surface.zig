@@ -14,7 +14,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const configured_provider = @import("../config/configured_provider.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
-const provider_presets = @import("../config/provider_presets.zig");
+const provider_management = @import("../config/provider_management.zig");
 const provider_secret_store = @import("../auth/provider_secret_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
@@ -2218,100 +2218,24 @@ fn parseProviderAddArgs(args: []const [:0]const u8) !ProviderAddOptions {
     return options;
 }
 
-fn parseProviderEfforts(arena: Allocator, raw: []const u8) ![]const []const u8 {
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "none")) return &.{};
-    var items: std.ArrayList([]const u8) = .empty;
-    var iterator = std.mem.splitScalar(u8, trimmed, ',');
-    while (iterator.next()) |part| {
-        const effort = std.mem.trim(u8, part, " \t");
-        if (effort.len == 0) return error.InvalidProviderEfforts;
-        const parsed = types.ReasoningEffort.parse(effort) orelse return error.InvalidProviderEfforts;
-        if (parsed.isDefault()) return error.InvalidProviderEfforts;
-        for (items.items) |existing| {
-            if (std.mem.eql(u8, existing, effort)) return error.InvalidProviderEfforts;
-        }
-        try items.append(arena, effort);
-    }
-    return items.toOwnedSlice(arena);
-}
-
-fn buildConfiguredProviderJson(
-    arena: Allocator,
-    name: []const u8,
-    base_url: []const u8,
-    auth: configured_provider.Auth,
-    tool_choice_mode: configured_provider.ToolChoiceMode,
-    model: ?[]const u8,
-    context_window: ?u32,
-    max_output_tokens: ?u32,
-    supports_tool_use: ?bool,
-    supports_vision: ?bool,
-    reasoning_efforts: []const []const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-    const writer = &out.writer;
-    try writer.writeByte('{');
-    try std.json.Stringify.value(name, .{}, writer);
-    try writer.writeAll(":{\"protocol\":\"openai-chat-completions\",\"base_url\":");
-    try std.json.Stringify.value(base_url, .{}, writer);
-    try writer.writeAll(",\"auth\":");
-    switch (auth) {
-        .none => try writer.writeAll("{\"type\":\"none\"}"),
-        .stored => try writer.writeAll("{\"type\":\"stored\"}"),
-        .bearer => |env| {
-            try writer.writeAll("{\"type\":\"bearer\",\"env\":");
-            try std.json.Stringify.value(env, .{}, writer);
-            try writer.writeByte('}');
-        },
-    }
-    if (tool_choice_mode == .send) try writer.writeAll(",\"tool_choice_mode\":\"send\"");
-    if (model) |id| {
-        try writer.writeAll(",\"model_metadata\":{");
-        try std.json.Stringify.value(id, .{}, writer);
-        try writer.writeAll(":{");
-        var comma = false;
-        if (context_window) |value| {
-            try writer.print("\"context_window\":{d}", .{value});
-            comma = true;
-        }
-        if (max_output_tokens) |value| {
-            if (comma) try writer.writeByte(',');
-            try writer.print("\"max_output_tokens\":{d}", .{value});
-            comma = true;
-        }
-        if (supports_tool_use) |value| {
-            if (comma) try writer.writeByte(',');
-            try writer.print("\"supports_tool_use\":{}", .{value});
-            comma = true;
-        }
-        if (supports_vision) |value| {
-            if (comma) try writer.writeByte(',');
-            try writer.print("\"supports_vision\":{}", .{value});
-            comma = true;
-        }
-        if (reasoning_efforts.len != 0) {
-            if (comma) try writer.writeByte(',');
-            try writer.writeAll("\"reasoning_efforts\":[");
-            for (reasoning_efforts, 0..) |effort, effort_index| {
-                if (effort_index != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(effort, .{}, writer);
-            }
-            try writer.writeByte(']');
-        }
-        try writer.writeAll("}}");
-    }
-    try writer.writeAll("}}");
-    return out.toOwnedSlice();
-}
-
-fn validProviderSecret(value: []const u8) bool {
-    if (value.len == 0 or value.len > provider_secret_store.max_secret_bytes) return false;
-    for (value) |byte| {
-        if (byte <= 0x20 or byte >= 0x7f) return false;
-    }
-    return true;
+fn providerDraftFromOptions(options: ProviderAddOptions) provider_management.Draft {
+    return .{
+        .name = options.name,
+        .base_url = options.base_url,
+        .api_key_env = options.api_key_env,
+        .save_api_key = options.save_api_key,
+        .no_auth = options.no_auth,
+        .model = options.model,
+        .context_window = options.context_window,
+        .max_output_tokens = options.max_output_tokens,
+        .tool_use = options.tool_use,
+        .no_tool_use = options.no_tool_use,
+        .vision = options.vision,
+        .no_vision = options.no_vision,
+        .reasoning_efforts_raw = options.reasoning_efforts,
+        .tool_choice_mode = options.tool_choice_mode,
+        .select = options.select,
+    };
 }
 
 fn runProviderAdd(alloc: Allocator, deps: RunDeps, args: []const [:0]const u8) !bool {
@@ -2341,102 +2265,8 @@ fn runProviderAdd(alloc: Allocator, deps: RunDeps, args: []const [:0]const u8) !
         return false;
     }
 
-    const preset: ?*const provider_presets.Preset = provider_presets.find(options.name);
-    const base_url = options.base_url orelse blk: {
-        if (preset) |value| break :blk value.base_url;
-        try writeStderr(deps, "fx provider add: --base-url is required for this provider\n");
-        return false;
-    };
-    const auth: configured_provider.Auth = if (options.no_auth)
-        .none
-    else if (options.save_api_key)
-        .stored
-    else blk: {
-        const env = options.api_key_env orelse blk_env: {
-            if (preset) |value| break :blk_env value.api_key_env;
-            try writeStderr(deps, "fx provider add: pass --api-key-env ENV, --save-api-key, or --no-auth\n");
-            return false;
-        };
-        break :blk .{ .bearer = env };
-    };
-
-    const model: ?[]const u8 = options.model orelse blk: {
-        if (preset) |value| break :blk value.models[0].id;
-        break :blk null;
-    };
-    if (options.select and model == null) {
-        try writeStderr(deps, "fx provider add: --model is required to select this provider\n");
-        return false;
-    }
-
-    var preset_model: ?*const provider_presets.ModelPreset = null;
-    if (preset) |value| {
-        if (model) |id| preset_model = value.model(id);
-    }
-    const efforts: []const []const u8 = if (options.reasoning_efforts) |raw|
-        parseProviderEfforts(arena, raw) catch {
-            try writeStderr(deps, "fx provider add: --reasoning-efforts must be a comma-separated list of effort names\n");
-            return false;
-        }
-    else if (preset_model) |value|
-        value.reasoning_efforts
-    else
-        &.{};
-    const supports_tool_use: ?bool = if (options.no_tool_use)
-        false
-    else if (options.tool_use)
-        true
-    else if (preset_model) |value|
-        value.supports_tool_use
-    else
-        null;
-    const supports_vision: ?bool = if (options.no_vision)
-        false
-    else if (options.vision)
-        true
-    else if (preset_model) |value|
-        value.supports_vision
-    else
-        null;
-    const context_window = options.context_window orelse if (preset_model) |value| value.context_window else null;
-    const max_output_tokens = options.max_output_tokens orelse if (preset_model) |value| value.max_output_tokens else null;
-
-    const json = try buildConfiguredProviderJson(
-        arena,
-        options.name,
-        base_url,
-        auth,
-        options.tool_choice_mode,
-        model,
-        context_window,
-        max_output_tokens,
-        supports_tool_use,
-        supports_vision,
-        efforts,
-    );
-    var registry = configured_provider.Registry.parse_json(arena, json) catch |err| {
-        try writeStderr(deps, switch (err) {
-            error.InvalidBaseUrl => "fx provider add: --base-url must be a valid http(s) URL\n",
-            error.InsecureBaseUrl => "fx provider add: plain http is only allowed for localhost\n",
-            error.InvalidEnvironmentName => "fx provider add: --api-key-env must be an environment variable name\n",
-            error.InvalidModelId, error.InvalidModelMetadata => "fx provider add: invalid --model or model metadata\n",
-            else => "fx provider add: could not build the provider definition\n",
-        });
-        return false;
-    };
-    const definition = registry.get(options.name).?;
-    const binding = definition.binding_identity();
-
-    var action: []const u8 = "add";
-    {
-        var existing = config_runtime.loadConfiguredProviders(alloc) catch {
-            try writeStderr(deps, "fx provider add: could not read ~/.fx/settings.json\n");
-            return false;
-        };
-        defer existing.deinit(alloc);
-        if (existing.get(options.name) != null) action = "update";
-    }
-
+    var secret_value: ?[]u8 = null;
+    defer if (secret_value) |value| secret.zeroAndFree(alloc, value);
     if (options.save_api_key) {
         if (provider_secret_store.isDisabled()) {
             try writeStderr(deps, "fx provider add: stored provider keys are disabled by FX_DISABLE_KEYCHAIN; use --api-key-env\n");
@@ -2451,61 +2281,115 @@ fn runProviderAdd(alloc: Allocator, deps: RunDeps, args: []const [:0]const u8) !
             try writeStderr(deps, "\nfx provider add: API key was not saved\n");
             return false;
         };
-        defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
-        if (!validProviderSecret(key)) {
+        if (!provider_management.validSecret(key)) {
+            secret.zeroAndFree(alloc, key);
             try writeStderr(deps, "fx provider add: API key must be printable ASCII and under 16 KiB\n");
             return false;
         }
-        provider_secret_store.store(alloc, binding, key) catch {
-            try writeStderr(deps, "fx provider add: API key could not be stored\n");
-            return false;
-        };
+        secret_value = key;
     }
 
-    var attempt = config_runtime.attemptProviderMutation(alloc, .{ .upsert = definition.* });
-    defer attempt.deinit(alloc);
-    switch (attempt) {
-        .failure => {
-            if (options.save_api_key) provider_secret_store.delete(binding) catch {};
+    const outcome = provider_management.applyAdd(
+        alloc,
+        arena,
+        providerDraftFromOptions(options),
+        secret_value,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MissingBaseUrl => {
+            try writeStderr(deps, "fx provider add: --base-url is required for this provider\n");
+            return false;
+        },
+        error.MissingAuth => {
+            try writeStderr(deps, "fx provider add: pass --api-key-env ENV, --save-api-key, or --no-auth\n");
+            return false;
+        },
+        error.MissingModelForSelection => {
+            try writeStderr(deps, "fx provider add: --model is required to select this provider\n");
+            return false;
+        },
+        error.InvalidProviderEfforts => {
+            try writeStderr(deps, "fx provider add: --reasoning-efforts must be a comma-separated list of effort names\n");
+            return false;
+        },
+        error.ReservedProviderId => {
+            try writeStderr(deps, "fx provider add: that name is reserved for a built-in provider\n");
+            return false;
+        },
+        error.InvalidProviderId => {
+            try writeStderr(deps, "fx provider add: name must start with a letter and use only letters, digits, '-' or '_'\n");
+            return false;
+        },
+        error.LimitExceeded => {
+            try writeStderr(deps, "fx provider add: name is too long\n");
+            return false;
+        },
+        error.InvalidBaseUrl => {
+            try writeStderr(deps, "fx provider add: --base-url must be a valid http(s) URL\n");
+            return false;
+        },
+        error.InsecureBaseUrl => {
+            try writeStderr(deps, "fx provider add: plain http is only allowed for localhost\n");
+            return false;
+        },
+        error.InvalidEnvironmentName => {
+            try writeStderr(deps, "fx provider add: --api-key-env must be an environment variable name\n");
+            return false;
+        },
+        error.InvalidModelId => {
+            try writeStderr(deps, "fx provider add: invalid --model or model metadata\n");
+            return false;
+        },
+        error.InvalidDefinition, error.WriteFailed => {
+            try writeStderr(deps, "fx provider add: could not build the provider definition\n");
+            return false;
+        },
+        error.InvalidSecret => {
+            try writeStderr(deps, "fx provider add: API key must be printable ASCII and under 16 KiB\n");
+            return false;
+        },
+        error.KeychainDisabled => {
+            try writeStderr(deps, "fx provider add: stored provider keys are disabled by FX_DISABLE_KEYCHAIN; use --api-key-env\n");
+            return false;
+        },
+        error.SecretStoreFailed => {
+            try writeStderr(deps, "fx provider add: API key could not be stored\n");
+            return false;
+        },
+        error.SecretRollbackFailed => {
             try writeStderr(deps, "fx provider add: could not save the provider to ~/.fx/settings.json\n");
             return false;
         },
-        .outcome => {},
-    }
-
-    var selected = false;
-    if (options.select) {
-        if (model) |id| {
-            var bound = model_provider.parse(options.name).?;
-            bound.configured.binding = binding;
-            var preference = config_runtime.attemptUserPreferences(alloc, .{
-                .provider = bound,
-                .model_preference = .{ .provider = bound, .model = id },
-            });
-            defer preference.deinit(alloc);
-            switch (preference) {
-                .failure => {
-                    try writeStderr(deps, "fx provider add: provider saved, but selecting it failed\n");
-                    return false;
-                },
-                .outcome => selected = true,
-            }
-        }
-    }
+        error.SettingsReadFailed => {
+            try writeStderr(deps, "fx provider add: could not read ~/.fx/settings.json\n");
+            return false;
+        },
+        error.SettingsWriteFailed => {
+            try writeStderr(deps, "fx provider add: could not save the provider to ~/.fx/settings.json\n");
+            return false;
+        },
+        error.SelectionFailed => {
+            try writeStderr(deps, "fx provider add: provider saved, but selecting it failed\n");
+            return false;
+        },
+    };
 
     const snapshot: output_contracts.ProviderMutationSnapshot = .{
-        .action = action,
-        .name = definition.id,
-        .base_url = definition.base_url,
-        .auth = switch (auth) {
+        .action = if (outcome.action == .add) "add" else "update",
+        .name = outcome.definition.id,
+        .base_url = outcome.definition.base_url,
+        .auth = switch (outcome.definition.auth) {
             .none => "none",
             .stored => "stored",
             .bearer => |env| try std.fmt.allocPrint(arena, "env:{s}", .{env}),
         },
-        .model = model,
-        .selected = selected,
-        .secret_saved = options.save_api_key,
+        .model = if (outcome.definition.model_metadata.len != 0)
+            outcome.definition.model_metadata[0].id
+        else
+            null,
+        .selected = outcome.selected,
+        .secret_saved = outcome.secret_saved,
     };
     const rendered = try snapshot.render(alloc, options.format);
     defer alloc.free(rendered);
@@ -2522,50 +2406,34 @@ fn runProviderList(alloc: Allocator, deps: RunDeps, args: []const [:0]const u8) 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var registry = config_runtime.loadConfiguredProviders(alloc) catch {
-        try writeStderr(deps, "fx provider list: could not read providers from ~/.fx/settings.json\n");
-        return false;
+    const summaries = provider_management.summaries(arena, alloc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SettingsReadFailed => {
+            try writeStderr(deps, "fx provider list: could not read providers from ~/.fx/settings.json\n");
+            return false;
+        },
+        error.SettingsLoadFailed => {
+            try writeStderr(deps, "fx provider list: could not load settings\n");
+            return false;
+        },
     };
-    defer registry.deinit(alloc);
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    defer alloc.free(workspace_root);
-    var settings = config_runtime.loadMergedSettings(alloc, workspace_root) catch {
-        try writeStderr(deps, "fx provider list: could not load settings\n");
-        return false;
-    };
-    defer settings.deinit(alloc);
 
     var entries: std.ArrayList(output_contracts.ProviderEntrySnapshot) = .empty;
     defer entries.deinit(alloc);
-    for (registry.definitions) |*definition| {
-        const binding = definition.binding_identity();
+    for (summaries) |summary| {
         var models: std.ArrayList([]const u8) = .empty;
-        for (definition.model_metadata) |metadata| try models.append(arena, metadata.id);
-        const selected = if (settings.provider) |selected_provider| blk: {
-            if (!std.mem.eql(u8, selected_provider.label(), definition.id)) break :blk false;
-            switch (selected_provider) {
-                .configured => |configured| {
-                    const selected_binding = configured.binding orelse break :blk false;
-                    break :blk std.mem.eql(u8, &selected_binding, &binding);
-                },
-                else => break :blk false,
-            }
-        } else false;
-        const identity = model_provider.parse(definition.id).?;
+        for (summary.definition.model_metadata) |metadata| try models.append(arena, metadata.id);
         try entries.append(alloc, .{
-            .name = definition.id,
-            .base_url = definition.base_url,
-            .auth = switch (definition.auth) {
+            .name = summary.definition.id,
+            .base_url = summary.definition.base_url,
+            .auth = switch (summary.definition.auth) {
                 .none => "none",
                 .stored => "stored",
                 .bearer => |env| try std.fmt.allocPrint(arena, "env:{s}", .{env}),
             },
-            .stored_credential_present = switch (definition.auth) {
-                .stored => provider_secret_store.present(binding),
-                .none, .bearer => false,
-            },
-            .selected = selected,
-            .selected_model = if (selected) settings.models.get(identity) else null,
+            .stored_credential_present = summary.stored_credential_present,
+            .selected = summary.selected,
+            .selected_model = summary.selected_model,
             .models = try models.toOwnedSlice(arena),
         });
     }
@@ -2589,47 +2457,34 @@ fn runProviderRemove(alloc: Allocator, deps: RunDeps, args: []const [:0]const u8
     const format: output_contracts.OutputFormat = if (args.len == 2) .json else .text;
     const name = args[0];
 
-    var registry = config_runtime.loadConfiguredProviders(alloc) catch {
-        try writeStderr(deps, "fx provider remove: could not read providers from ~/.fx/settings.json\n");
-        return false;
-    };
-    defer registry.deinit(alloc);
-    const definition = registry.get(name) orelse {
-        const message = try std.fmt.allocPrint(alloc, "fx provider remove: unknown provider {s}\n", .{name});
-        defer alloc.free(message);
-        try writeStderr(deps, message);
-        return false;
-    };
-    const binding = definition.binding_identity();
-    const stored_auth = switch (definition.auth) {
-        .stored => true,
-        .none, .bearer => false,
-    };
-
-    var attempt = config_runtime.attemptProviderMutation(alloc, .{ .remove = name });
-    defer attempt.deinit(alloc);
-    switch (attempt) {
-        .failure => {
+    const outcome = provider_management.applyRemove(alloc, name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SettingsReadFailed => {
+            try writeStderr(deps, "fx provider remove: could not read providers from ~/.fx/settings.json\n");
+            return false;
+        },
+        error.UnknownProvider => {
+            const message = try std.fmt.allocPrint(alloc, "fx provider remove: unknown provider {s}\n", .{name});
+            defer alloc.free(message);
+            try writeStderr(deps, message);
+            return false;
+        },
+        error.SettingsWriteFailed => {
             const message = try std.fmt.allocPrint(alloc, "fx provider remove: could not remove {s} from ~/.fx/settings.json\n", .{name});
             defer alloc.free(message);
             try writeStderr(deps, message);
             return false;
         },
-        .outcome => {},
-    }
-    var secret_removed = false;
-    if (stored_auth) {
-        provider_secret_store.delete(binding) catch {
+        error.SecretDeleteFailed => {
             try writeStderr(deps, "fx provider remove: provider removed, but its stored API key could not be deleted\n");
             return false;
-        };
-        secret_removed = true;
-    }
+        },
+    };
 
     const snapshot: output_contracts.ProviderMutationSnapshot = .{
         .action = "remove",
         .name = name,
-        .secret_removed = secret_removed,
+        .secret_removed = outcome.secret_removed,
     };
     const rendered = try snapshot.render(alloc, format);
     defer alloc.free(rendered);
@@ -6725,14 +6580,14 @@ test "provider efforts parse only named non default efforts" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const parsed = try parseProviderEfforts(arena, " low , high,max ");
+    const parsed = try provider_management.parseEfforts(arena, " low , high,max ");
     try std.testing.expectEqual(@as(usize, 3), parsed.len);
     try std.testing.expectEqualStrings("low", parsed[0]);
     try std.testing.expectEqualStrings("max", parsed[2]);
-    try std.testing.expectEqual(@as(usize, 0), (try parseProviderEfforts(arena, "none")).len);
-    try std.testing.expectEqual(@as(usize, 0), (try parseProviderEfforts(arena, "  ")).len);
-    try std.testing.expectError(error.InvalidProviderEfforts, parseProviderEfforts(arena, "auto"));
-    try std.testing.expectError(error.InvalidProviderEfforts, parseProviderEfforts(arena, "high,high"));
-    try std.testing.expectError(error.InvalidProviderEfforts, parseProviderEfforts(arena, "high,"));
-    try std.testing.expectError(error.InvalidProviderEfforts, parseProviderEfforts(arena, "contains space"));
+    try std.testing.expectEqual(@as(usize, 0), (try provider_management.parseEfforts(arena, "none")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try provider_management.parseEfforts(arena, "  ")).len);
+    try std.testing.expectError(error.InvalidProviderEfforts, provider_management.parseEfforts(arena, "auto"));
+    try std.testing.expectError(error.InvalidProviderEfforts, provider_management.parseEfforts(arena, "high,high"));
+    try std.testing.expectError(error.InvalidProviderEfforts, provider_management.parseEfforts(arena, "high,"));
+    try std.testing.expectError(error.InvalidProviderEfforts, provider_management.parseEfforts(arena, "contains space"));
 }

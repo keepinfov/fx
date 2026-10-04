@@ -442,6 +442,9 @@ pub const RenderContext = struct {
     provider_picker_completion_index: usize = 0,
     provider_picker_completion_window_start: usize = 0,
     provider_picker_completion_anchor: usize = 0,
+    /// The provider setup wizard is collecting a secret: the composer content
+    /// renders masked so a pasted key never appears on screen.
+    provider_admin_mask_input: bool = false,
     file_query_active: bool = false,
     file_completions: []const file_index.SearchResult = &.{},
     file_completion_index: usize = 0,

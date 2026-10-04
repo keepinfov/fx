@@ -8356,3 +8356,57 @@ tmuxTest("provider preparation completes existing-key recovery for a held prompt
   expect(gateway.requests[0]!.headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
   expect(readFileSync(stderrPath, "utf8")).toBe("");
 }, TIMEOUT);
+
+tmuxTest("provider picker adds a saved connection through the wizard", async () => {
+  home = mkdtempSync(join(tmpdir(), "fx-provider-wizard-"));
+  stderrPath = join(home, "stderr.log");
+  writeFileSync(stderrPath, "");
+  gateway = startFakeGateway([]);
+  session = await startFx(home, stderrPath, gateway);
+  await session.waitForComposer(TIMEOUT);
+
+  await session.sendLiteral("/provider\r");
+  await session.waitForText("add connection", TIMEOUT);
+  await session.sendLiteral("add");
+  await session.sendKeys("Enter");
+  await session.waitForText("Add provider: name", TIMEOUT);
+
+  await session.sendLiteral("e2e-conn");
+  await session.sendKeys("Enter");
+  await session.waitForText("Base URL (required)", TIMEOUT);
+
+  await session.sendLiteral("http://127.0.0.1:9/v1");
+  await session.sendKeys("Enter");
+  await session.waitForText("Auth [none/env/stored]", TIMEOUT);
+
+  await session.sendLiteral("none");
+  await session.sendKeys("Enter");
+  await session.waitForText("Model (required)", TIMEOUT);
+
+  await session.sendLiteral("e2e-model");
+  await session.sendKeys("Enter");
+  await session.waitForText("Context window in tokens", TIMEOUT);
+
+  await session.sendKeys("Enter");
+  await session.waitForText("Max output tokens", TIMEOUT);
+  await session.sendKeys("Enter");
+  await session.waitForText("Tool use", TIMEOUT);
+  await session.sendKeys("Enter");
+  await session.waitForText("Vision", TIMEOUT);
+  await session.sendKeys("Enter");
+  await session.waitForText("Reasoning efforts", TIMEOUT);
+  await session.sendKeys("Enter");
+  await session.waitForText("Save this connection?", TIMEOUT);
+  await session.sendLiteral("yes");
+  await session.sendKeys("Enter");
+  await session.waitForText("Added connection 'e2e-conn'", TIMEOUT);
+
+  await session.sendLiteral("/provider\r");
+  await session.waitForPane(
+    (pane) => pane.includes("e2e-conn") && pane.includes("manage connections"),
+    TIMEOUT,
+  );
+  expect(readFileSync(join(home, ".fx", "settings.json"), "utf8")).toContain("e2e-conn");
+  expect(session.isAlive()).toBe(true);
+  expect(readFileSync(stderrPath, "utf8")).toBe("");
+}, TIMEOUT * 2);

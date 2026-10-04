@@ -621,6 +621,10 @@ pub fn Runtime(comptime App: type) type {
                         provider_picker_index = app.input_runtime.picker.key_source_column_index;
                         provider_picker_window_start = app.input_runtime.picker.key_source_column_window_start;
                     },
+                    .manage, .manage_actions, .manage_confirm => {
+                        provider_picker_index = app.input_runtime.picker.manage_column_index;
+                        provider_picker_window_start = app.input_runtime.picker.manage_column_window_start;
+                    },
                     .api_key => {},
                 }
             }
@@ -739,6 +743,10 @@ pub fn Runtime(comptime App: type) type {
                 .provider_picker_completion_index = provider_picker_index,
                 .provider_picker_completion_window_start = provider_picker_window_start,
                 .provider_picker_completion_anchor = provider_picker_anchor,
+                .provider_admin_mask_input = if (comptime @hasField(App, "provider_admin"))
+                    app.provider_admin.maskingInput()
+                else
+                    false,
                 .file_query_active = file_query != null,
                 .file_completions = file_view.items,
                 .file_completion_index = file_selection orelse 0,

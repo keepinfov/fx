@@ -23,6 +23,12 @@ pub const ProviderPickerStage = enum {
     key_source,
     /// Not a list: the column is the masked API key field.
     api_key,
+    /// Saved connections with a trailing `back` row.
+    manage,
+    /// Actions for the selected connection: edit, remove, back.
+    manage_actions,
+    /// Destructive confirmation: remove or cancel.
+    manage_confirm,
 };
 
 pub const InlinePickerKind = enum {
@@ -113,6 +119,8 @@ pub const State = struct {
     team_column_window_start: usize = 0,
     key_source_column_index: usize = 0,
     key_source_column_window_start: usize = 0,
+    manage_column_index: usize = 0,
+    manage_column_window_start: usize = 0,
     file_completion: file_completion_state.State = .{},
     // The ordinal is meaningful only within file_completion's presented rows.
     file_completion_index: usize = 0,
@@ -280,16 +288,22 @@ pub const State = struct {
         const prefix_len = providerPickerPrefixLen(trimmed) orelse return null;
 
         const stage = self.provider_picker_stage;
-        if (stage == .provider) return .{
-            .stage = .provider,
-            .prefix = trimmed[0..prefix_len],
-            .query = trimmed[prefix_len..],
-            .token_start = trim_start + prefix_len,
-        };
+        switch (stage) {
+            // The manage screens refine a choice made in the provider column,
+            // not a token typed into the composer; they anchor on the same
+            // query text so typing filters their rows.
+            .provider, .manage, .manage_actions, .manage_confirm => return .{
+                .stage = stage,
+                .prefix = trimmed[0..prefix_len],
+                .query = trimmed[prefix_len..],
+                .token_start = trim_start + prefix_len,
+            },
+            else => {},
+        }
 
         const method: ?[]const u8 = switch (stage) {
             .team, .key_source, .api_key => self.provider_picker_pending_method.items,
-            .provider, .method => null,
+            .provider, .method, .manage, .manage_actions, .manage_confirm => null,
         };
         const token_start = providerPickerTokenStart(
             trimmed,
@@ -329,6 +343,10 @@ pub const State = struct {
             .key_source => {
                 self.key_source_column_index = 0;
                 self.key_source_column_window_start = 0;
+            },
+            .manage, .manage_actions, .manage_confirm => {
+                self.manage_column_index = 0;
+                self.manage_column_window_start = 0;
             },
             .api_key => {},
         }
@@ -373,6 +391,8 @@ pub const State = struct {
         self.team_column_window_start = 0;
         self.key_source_column_index = 0;
         self.key_source_column_window_start = 0;
+        self.manage_column_index = 0;
+        self.manage_column_window_start = 0;
     }
 
     pub fn isModelShapedInput(self: *const State, editor: *const editor_state.State) bool {

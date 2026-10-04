@@ -591,6 +591,20 @@ pub fn dangerStatusText(
     return "";
 }
 
+/// Replaces typed secret bytes with bullets for the composer display. The
+/// undisplayed tail stays implicit: the prompt states what is being entered,
+/// and the real length is never needed on screen.
+pub fn maskedInputDisplay(alloc: Allocator, input: []const u8) ![]const u8 {
+    const max_glyphs = 64;
+    const glyph = "\u{2022}";
+    const shown = @min(input.len, max_glyphs);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (0..shown) |_| try out.appendSlice(alloc, glyph);
+    if (input.len > max_glyphs) try out.appendSlice(alloc, "\u{2026}");
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn composeSkillsMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool) !std.ArrayList(u8) {
     return composeCatalogMenuHintRow(alloc, width, ctrl_c_pending, .source);
 }
