@@ -3231,10 +3231,10 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
 fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
     const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
     while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
-        };
+        // Ask the engine's own definition of aliveness: a process that was
+        // terminated but not yet reaped is a zombie, and how promptly the host
+        // reaps orphans must not read as a surviving descendant.
+        if (!try process_tree.processIsAlive(std.testing.allocator, pid)) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.TestUnexpectedResult;
@@ -4707,18 +4707,10 @@ test "timeout terminates foreground process group descendants" {
         10,
     );
 
-    const started_ms = io_mod.milliTimestamp();
-    while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => break,
-            else => return err,
-        };
-        if (io_mod.milliTimestamp() - started_ms > 1000) {
-            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-            return error.TestUnexpectedResult;
-        }
-        io_mod.sleep(10 * std.time.ns_per_ms);
-    }
+    expectProcessGoneWithinForTest(pid, 1_000) catch |err| {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        return err;
+    };
 }
 
 test "timeout terminates redirected descendant after setsid" {
