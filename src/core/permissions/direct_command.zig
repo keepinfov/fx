@@ -6,6 +6,7 @@ const command_runner = @import("../execution/command_runner.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
+const system_tools = @import("../shared/system_tools.zig");
 const types = @import("../shared/types.zig");
 
 pub const direct_output_limit_bytes: usize = 65_536;
@@ -217,9 +218,10 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
         const stage = plan.stages[child_count];
         var environment = try environmentForProfile(scratch, stage.environment_profile);
         defer environment.deinit();
+        const argv = try resolveStageArgv(scratch, stage.argv, environment);
 
         const child = std.process.spawn(io_mod.getIo(), .{
-            .argv = stage.argv,
+            .argv = argv,
             .cwd = .{ .path = plan.cwd },
             .environ_map = &environment,
             .stdin = if (child_count == 0) .ignore else .pipe,
@@ -406,6 +408,20 @@ fn executeDirectReadOnlyWithLimitAndTestControls(
     );
 }
 
+/// Native plans name conventional absolute paths such as `/bin/ls`. A host
+/// that keeps its userland elsewhere reports those as missing, so when the
+/// planned path does not exist the same program is looked up on the execution
+/// PATH: the restricted, root-owned list this engine already hands the child.
+/// The plan is left unchanged; only the spawned argv[0] is substituted.
+fn resolveStageArgv(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    environment: std.process.Environ.Map,
+) ![]const []const u8 {
+    const path = environment.get("PATH") orelse return argv;
+    return system_tools.resolvePlannedArgvAlloc(alloc, argv, path);
+}
+
 fn environmentForProfile(
     alloc: std.mem.Allocator,
     profile: command_effect.EnvironmentProfile,
@@ -414,7 +430,9 @@ fn environmentForProfile(
     errdefer environment.deinit();
     switch (profile) {
         .basic_read_only, .git_read_only => {
-            try environment.put("PATH", "/usr/bin:/bin");
+            const path = try system_tools.readOnlyPathAlloc(alloc);
+            defer alloc.free(path);
+            try environment.put("PATH", path);
             try environment.put("LC_ALL", "C");
             try environment.put("LANG", "C");
         },
@@ -951,6 +969,7 @@ test "direct executor runs fixed argv with sanitized environment and no artifact
 
     try std.testing.expect(std.mem.find(u8, result.output, "PATH=/usr/bin:/bin") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "LC_ALL=C") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, "LC_ALL=C") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "LANG=C") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "HOME=") == null);
     try std.testing.expectEqual(@as(?[]const u8, null), result.command_result.?.output_file);
@@ -960,7 +979,7 @@ test "git direct profile removes ambient authority and disables optional mutatio
     var environment = try environmentForProfile(std.testing.allocator, .git_read_only);
     defer environment.deinit();
 
-    try std.testing.expectEqualStrings("/usr/bin:/bin", environment.get("PATH").?);
+    try std.testing.expect(std.mem.startsWith(u8, environment.get("PATH").?, "/usr/bin:/bin"));
     try std.testing.expectEqualStrings("1", environment.get("GIT_CONFIG_NOSYSTEM").?);
     try std.testing.expectEqualStrings("/dev/null", environment.get("GIT_CONFIG_GLOBAL").?);
     try std.testing.expectEqualStrings("0", environment.get("GIT_OPTIONAL_LOCKS").?);
@@ -1662,7 +1681,10 @@ test "direct executor reports final stage status without pipefail" {
 test "direct relay treats a closed downstream pipe as normal completion" {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
 
-    const argv = [_][]const u8{"/usr/bin/false"};
+    const false_path = (try system_tools.findStandardAlloc(std.testing.allocator, "false")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(false_path);
+    const argv = [_][]const u8{false_path};
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = &argv,
         .stdin = .pipe,
