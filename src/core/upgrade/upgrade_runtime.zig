@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
@@ -211,7 +212,7 @@ fn upgradeWorkerInner(
     const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(archive_url);
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .upgrade, archive_url);
     defer client.deinit();
 
     helpers.downloadFileStreamingWithProgress(&client, archive_url, archive_path, .{

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const update_target = @import("update_target.zig");
 
 const Allocator = std.mem.Allocator;
@@ -76,10 +77,10 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
             break :blk Target.initStable(alloc, latest) catch return error.FetchFailed;
         },
         .dev => blk: {
-            var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-            defer client.deinit();
             const url = try std.fmt.allocPrint(alloc, "{s}/dev.json", .{base_url});
             defer alloc.free(url);
+            var client = proxy_mod.initClient(alloc, .upgrade, url);
+            defer client.deinit();
             const manifest = try fetchTextBounded(
                 &client,
                 alloc,
@@ -94,10 +95,10 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
 }
 
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8, control: TransferControl) ![]u8 {
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
     const url = try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
     defer alloc.free(url);
+    var client = proxy_mod.initClient(alloc, .upgrade, url);
+    defer client.deinit();
 
     const raw = try fetchTextBounded(
         &client,

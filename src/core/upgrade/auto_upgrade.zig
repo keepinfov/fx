@@ -1,5 +1,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
@@ -282,9 +283,6 @@ pub const AutoUpgrade = struct {
         target: update_target.Target,
         cdn_base: []const u8,
     ) InstallError!void {
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-        defer client.deinit();
-
         const tmp_base: []const u8 = io_mod.getenv("TMPDIR") orelse "/tmp";
         sweepStaleDownloadDirs(tmp_base, io_mod.nanoTimestamp());
         var rand_buf: [8]u8 = undefined;
@@ -301,6 +299,9 @@ pub const AutoUpgrade = struct {
 
         const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
         defer alloc.free(archive_url);
+
+        var client = proxy_mod.initClient(alloc, .upgrade, archive_url);
+        defer client.deinit();
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path, self.transferControl()) catch |err| return switch (err) {
             error.Cancelled => error.Cancelled,

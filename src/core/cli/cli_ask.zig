@@ -1530,14 +1530,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     };
     if (io_mod.getenv("FX_BENCH") == null and startup.provider == .gateway) {
         if (alloc.create(http_pool.HttpPool)) |pool| {
-            pool.* = http_pool.HttpPool.init(alloc);
+            const warm_url = gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url);
+            pool.* = http_pool.HttpPool.initForUrl(alloc, .model, warm_url);
             gateway_pool = pool;
             if (cfg.provider_set.gateway.agent_stream) |stream| {
                 var stamped = stream;
                 stamped.context = pool;
                 cfg.provider_set.gateway.agent_stream = stamped;
             }
-            pool.warmAsync(gateway_client.resolveChatUrlForWarmup(cfg.gateway_chat_url));
+            pool.warmAsync(warm_url);
         } else |_| {}
     }
     try checkHeadlessCancellation(options.deps);

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const proxy_mod = @import("core/shared/proxy.zig");
 
 pub const version = "0.0.12";
 
@@ -698,10 +699,11 @@ const App = struct {
             launch.modifiers.saved_directories_suppressed,
         );
         if (comptime !host_target.is_wasm) {
-            app.provider_selection.ensureGatewayHttpPool();
+            const warm_url = gateway_client.resolveChatUrlForWarmup(builtin_gateway.agentChatUrl());
+            app.provider_selection.ensureGatewayHttpPool(warm_url);
             if (app.provider_selection.selection().provider == .gateway) {
                 if (app.provider_selection.gateway_http_pool) |pool| {
-                    pool.warmAsync(gateway_client.resolveChatUrlForWarmup(builtin_gateway.agentChatUrl()));
+                    pool.warmAsync(warm_url);
                 }
             }
         }
@@ -3505,6 +3507,15 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     io_mod.setRawEnviron(raw_env);
 
     const alloc = processAllocator();
+    // Resolve the outbound proxy policy once, before any command can open a
+    // connection. A configured-but-broken proxy is fatal rather than a silent
+    // direct connection.
+    proxy_mod.initFromEnvironment(alloc) catch |err| {
+        try writeStderrFast("fx: invalid proxy configuration (");
+        try writeStderrFast(@errorName(err));
+        try writeStderrFast(")\n");
+        exitFast(1);
+    };
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
         try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
         exitFast(1);

@@ -5,6 +5,7 @@ const image_attachments = @import("../core/images/image_attachments.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
@@ -259,7 +260,7 @@ pub fn streamPrepared(
         extra_count += 1;
     };
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .model, request_endpoint);
     defer client.deinit();
     var open_operation = gateway_client.PostOperation{
         .client = &client,

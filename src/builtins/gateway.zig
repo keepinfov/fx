@@ -16,6 +16,7 @@ const gateway_client = @import("../gateway/client.zig");
 const vercel_failure_diagnostics = @import("../gateway/vercel_failure_diagnostics.zig");
 const vercel_protocol = @import("../gateway/vercel_protocol.zig");
 const io_mod = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const gateway_generation_usage = @import("../gateway/generation_usage.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
@@ -850,10 +851,7 @@ const OAuthHttpOperation = struct {
     request: oauth_transport.Request,
 
     pub fn run(self: *@This()) !oauth_transport.Response {
-        var client: std.http.Client = .{
-            .allocator = self.alloc,
-            .io = io_mod.getIo(),
-        };
+        var client = proxy_mod.initClient(self.alloc, .model, self.request.url);
         defer client.deinit();
 
         const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);
