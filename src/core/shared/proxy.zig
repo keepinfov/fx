@@ -52,14 +52,57 @@ pub const Config = struct {
 
 pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, OutOfMemory };
 
-/// Explicit configuration layers, highest priority first. `override` carries
+/// Explicit configuration layers, highest priority first. `override_*` carry
 /// per-launch flags, `stored` carries profile settings after the config
 /// runtime merged workspace and profile layers. `FX_PROXY` sits between them
-/// and the standard environment fallback.
+/// and the standard environment fallback. Each override refines the selected
+/// explicit configuration, so `--proxy` alone changes only the URL and
+/// `--no-proxy` alone changes only the bypass list.
 pub const Sources = struct {
-    override: ?Config = null,
+    override_url: ?[]const u8 = null,
+    override_no_proxy: ?[]const []const u8 = null,
+    override_apply_to: ?[]const Surface = null,
     stored: ?Config = null,
 };
+
+/// Per-launch flags, registered by the CLI surface as soon as they parse and
+/// long before the first resolution. Copies are owned here for the process
+/// lifetime, exactly like the resolution itself, because the CLI's own
+/// argument storage does not outlive the command.
+var flag_layer: FlagLayer = .{};
+var flag_arena: ?*std.heap.ArenaAllocator = null;
+
+const FlagLayer = struct {
+    url: ?[]const u8 = null,
+    no_proxy: ?[]const []const u8 = null,
+    apply_to: ?[]const Surface = null,
+};
+
+/// Registers `--proxy` / `--no-proxy` / `--proxy-apply-to`. Passing null for
+/// every field clears the layer.
+pub fn setFlagOverrides(
+    url: ?[]const u8,
+    no_proxy: ?[]const []const u8,
+    apply_to: ?[]const Surface,
+) ConfigError!void {
+    if (flag_arena == null) {
+        const created = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+        created.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        flag_arena = created;
+    }
+    const arena = flag_arena.?.allocator();
+    const previous = flag_layer;
+    flag_layer = .{};
+    errdefer flag_layer = previous;
+
+    if (url) |value| flag_layer.url = try arena.dupe(u8, value);
+    if (no_proxy) |entries| {
+        const copied = try arena.alloc([]const u8, entries.len);
+        for (entries, 0..) |entry, index| copied[index] = try arena.dupe(u8, entry);
+        flag_layer.no_proxy = copied;
+    }
+    if (apply_to) |surfaces| flag_layer.apply_to = try arena.dupe(Surface, surfaces);
+}
 
 /// A `proxy` block from `settings.json`. Owns its strings and lists.
 pub const StoredConfig = struct {
@@ -155,6 +198,12 @@ fn initFromEnvMap(environ: *const std.process.Environ.Map, sources: Sources) Con
 fn reset() void {
     if (global_state) |state| destroyState(state);
     global_state = null;
+    flag_layer = .{};
+    if (flag_arena) |arena| {
+        arena.deinit();
+        std.heap.page_allocator.destroy(arena);
+        flag_arena = null;
+    }
 }
 
 fn destroyState(state: *State) void {
@@ -179,12 +228,22 @@ fn resolveAndInstall(env: EnvSource, sources: Sources) ConfigError!void {
     // entries parsed out of the environment.
     const arena = state.arena.allocator();
 
-    if (sources.override) |config| {
-        try applyExplicit(state, arena, config);
-    } else if (explicitConfigFromEnv(arena, env)) |config| {
-        try applyExplicit(state, arena, config);
-    } else if (sources.stored) |config| {
-        try applyExplicit(state, arena, config);
+    const override_url = sources.override_url orelse flag_layer.url;
+    const override_no_proxy = sources.override_no_proxy orelse flag_layer.no_proxy;
+    const override_apply_to = sources.override_apply_to orelse flag_layer.apply_to;
+
+    // Explicit configuration, highest priority first: FX_PROXY, then stored
+    // profile settings. Flags refine whichever one is selected.
+    var explicit: ?Config = explicitConfigFromEnv(arena, env) orelse sources.stored;
+    if (override_url) |url| {
+        var config: Config = explicit orelse .{ .url = url };
+        config.url = url;
+        explicit = config;
+    }
+    if (explicit) |*config| {
+        if (override_no_proxy) |entries| config.no_proxy = entries;
+        if (override_apply_to) |surfaces| config.apply_to = surfaces;
+        try applyExplicit(state, arena, config.*);
     }
     try applyEnvironment(state, arena, env);
 
@@ -703,7 +762,7 @@ test "source priority: flags override FX_PROXY, which overrides stored settings"
 
     const stored: Config = .{ .url = "http://127.0.0.1:9999" };
     try initFromEnvMap(&map, .{
-        .override = .{ .url = "http://127.0.0.1:1111" },
+        .override_url = "http://127.0.0.1:1111",
         .stored = stored,
     });
     defer reset();
@@ -729,6 +788,41 @@ test "stored settings apply when neither flags nor FX_PROXY are present" {
     var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
     defer mcp.deinit();
     try testing.expect(mcp.https_proxy == null);
+}
+
+test "flag overrides refine the selected explicit configuration" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
+    defer map.deinit();
+
+    try setFlagOverrides("http://127.0.0.1:2222", &.{"api.corp"}, &.{.model});
+    defer reset();
+
+    try initFromEnvMap(&map, .{});
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 2222), client.https_proxy.?.port);
+
+    var bypassed = initClient(testing.allocator, .model, "https://api.corp/v1/models");
+    defer bypassed.deinit();
+    try testing.expect(bypassed.https_proxy == null);
+
+    // The scope is the flag's, so a surface outside it stays on the fallback.
+    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer mcp.deinit();
+    try testing.expect(mcp.https_proxy == null);
+}
+
+test "a flag url applies with no other configuration present" {
+    var map = try testEnv(&.{});
+    defer map.deinit();
+
+    try setFlagOverrides("http://127.0.0.1:3333", null, null);
+    defer reset();
+
+    try initFromEnvMap(&map, .{});
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 3333), client.https_proxy.?.port);
 }
 
 test "an explicit url is copied so its parsed host outlives the caller buffer" {

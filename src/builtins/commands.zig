@@ -371,6 +371,18 @@ pub const top_level_flags = [_]TopLevelFlag{
         .description = "Turn Fast mode on or off for an interactive session",
     },
     .{
+        .usage = "--proxy <url>",
+        .description = "Send outbound traffic through a proxy such as http://user:pass@127.0.0.1:8080",
+    },
+    .{
+        .usage = "--no-proxy <a,b,...>",
+        .description = "Hosts, suffixes, host:port, or CIDRs that skip the proxy",
+    },
+    .{
+        .usage = "--proxy-apply-to <a,b,...>",
+        .description = "Surfaces the proxy covers: model, mcp, upgrade; defaults to the configured scope",
+    },
+    .{
         .usage = "-c, --continue",
         .description = "Resume the remembered workspace session",
     },
