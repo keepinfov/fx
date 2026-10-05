@@ -150,6 +150,9 @@ const SurfaceSet = std.EnumSet(Surface);
 const State = struct {
     arena: std.heap.ArenaAllocator,
     explicit_url: ?[]const u8 = null,
+    /// `explicit_url` with credentials masked, built with the resolution so
+    /// every surface can display it without allocating.
+    masked_explicit_url: ?[]const u8 = null,
     explicit_proxy: ?*std.http.Client.Proxy = null,
     explicit_rules: []const Rule = &.{},
     explicit_surfaces: SurfaceSet = SurfaceSet.initEmpty(),
@@ -278,6 +281,7 @@ fn applyExplicit(state: *State, arena: std.mem.Allocator, config: Config) Config
     // for the lifetime of the client, and a caller that owns that buffer, such
     // as the parsed settings JSON, may free it long before the last request.
     state.explicit_url = try arena.dupe(u8, url);
+    state.masked_explicit_url = try text_utils.redactUrlForDisplay(arena, url);
     state.explicit_proxy = try buildProxy(arena, state.explicit_url.?);
     state.explicit_rules = try parseRules(arena, config.no_proxy);
     state.explicit_surfaces = surfaceSet(config.apply_to);
@@ -314,21 +318,68 @@ fn envProxy(
     return null;
 }
 
+/// Where a surface's policy comes from. Diagnostics only: the exact per-request
+/// decision also depends on the request host and the bypass list.
+pub const Source = enum { explicit, environment, none };
+
+/// The source that governs `surface`. A surface inside the explicit scope never
+/// falls back to the standard environment, because an explicit bypass entry
+/// means a direct connection. `children` inherits the standard variables from
+/// the parent environment even when fx exports nothing of its own.
+pub fn sourceFor(surface: Surface) Source {
+    const state = global_state orelse return .none;
+    if (state.explicit_proxy != null and state.explicit_surfaces.contains(surface)) return .explicit;
+    return if (state.env_configured) .environment else .none;
+}
+
 /// Whether `surface` resolves to a proxy at all. Diagnostics only: the exact
 /// per-request decision also depends on the request host.
 pub fn isEnabled(surface: Surface) bool {
+    return sourceFor(surface) != .none;
+}
+
+/// The surfaces an explicit proxy covers, in declaration order. Empty when no
+/// explicit proxy is configured. Borrowed from the resolution; the returned
+/// slice is valid for the process lifetime.
+pub fn explicitSurfaces(buffer: []Surface) []const Surface {
+    const state = global_state orelse return &.{};
+    if (state.explicit_proxy == null) return &.{};
+    var count: usize = 0;
+    for (std.meta.tags(Surface)) |surface| {
+        if (count == buffer.len) break;
+        if (!state.explicit_surfaces.contains(surface)) continue;
+        buffer[count] = surface;
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+/// Whether the standard proxy variables provide a fallback for surfaces without
+/// an explicit setting.
+pub fn environmentConfigured() bool {
     const state = global_state orelse return false;
-    if (surface == .children) return false;
-    if (state.explicit_proxy != null and state.explicit_surfaces.contains(surface)) return true;
     return state.env_configured;
 }
 
 /// The explicit proxy URL with credentials masked, or null when no explicit
-/// proxy is configured. Caller owns the returned memory.
-pub fn maskedExplicitUrl(alloc: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
+/// proxy is configured. Borrowed from the resolution; the returned slice is
+/// valid for the process lifetime.
+pub fn maskedExplicitUrl() ?[]const u8 {
     const state = global_state orelse return null;
-    const url = state.explicit_url orelse return null;
-    return try text_utils.redactUrlForDisplay(alloc, url);
+    return state.masked_explicit_url;
+}
+
+/// Masks credentials in one proxy URL for display. Caller owns the memory.
+pub fn maskUrl(alloc: std.mem.Allocator, url: []const u8) error{OutOfMemory}![]u8 {
+    return text_utils.redactUrlForDisplay(alloc, url);
+}
+
+/// The stored proxy as a single display value: the masked explicit URL, `off`
+/// when nothing explicit is configured, and `off (environment)` when only the
+/// standard variables would route traffic. Borrowed from the resolution.
+pub fn displayValue() []const u8 {
+    if (maskedExplicitUrl()) |url| return url;
+    return if (environmentConfigured()) "off (environment)" else "off";
 }
 
 /// Applies the process proxy policy to an already-created client. Safe to call
@@ -653,17 +704,43 @@ test "buildProxy parses scheme, port, and credentials" {
 }
 
 test "maskedExplicitUrl hides credentials" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
     var map = try testEnv(&.{.{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" }});
     defer map.deinit();
 
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    const masked = (try maskedExplicitUrl(arena.allocator())).?;
+    const masked = maskedExplicitUrl().?;
     try testing.expect(std.mem.find(u8, masked, "secret") == null);
     try testing.expectEqualStrings("http://[redacted]@127.0.0.1:8080", masked);
+}
+
+test "sourceFor reports where each surface resolves" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "HTTPS_PROXY", "http://env-proxy.example:3128" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    try testing.expectEqual(Source.explicit, sourceFor(.model));
+    try testing.expectEqual(Source.environment, sourceFor(.mcp));
+    try testing.expectEqual(Source.environment, sourceFor(.upgrade));
+    // Children inherit the standard variables unless fx exports an explicit
+    // proxy for them.
+    try testing.expectEqual(Source.environment, sourceFor(.children));
+    try testing.expect(isEnabled(.mcp));
+    try testing.expect(environmentConfigured());
+
+    var buffer: [4]Surface = undefined;
+    try testing.expectEqualSlices(Surface, &.{.model}, explicitSurfaces(&buffer));
+
+    reset();
+    try testing.expectEqual(Source.none, sourceFor(.model));
+    try testing.expect(!environmentConfigured());
+    try testing.expectEqualSlices(Surface, &.{}, explicitSurfaces(&buffer));
 }
 
 test "explicit FX_PROXY applies to model and leaves other surfaces to the environment" {

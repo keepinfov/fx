@@ -15,6 +15,7 @@ const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const editor_state = @import("../input/editor_state.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const feedback_runtime = @import("../feedback/runtime.zig");
@@ -3978,6 +3979,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     snapshot.login_shell = shell_resolver.configuredLoginShell() orelse "default";
+    snapshot.proxy = proxy_mod.maskedExplicitUrl() orelse "off";
     if (comptime @hasDecl(App, "notificationPreferences")) {
         const notifications = app.notificationPreferences();
         snapshot.sound_level = settings_catalog.notificationLevel(
@@ -4029,6 +4031,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
     switch (change.setting) {
         .model => unreachable,
         .login_shell => unreachable,
+        .proxy => unreachable,
         .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             const item = statuslineItemForSetting(change.setting).?;

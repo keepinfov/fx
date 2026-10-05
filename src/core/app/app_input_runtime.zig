@@ -2519,6 +2519,29 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
+        /// Settings that are edited by typing a value rather than by cycling
+        /// options: prefill the composer with the matching `/settings` command
+        /// and let the user finish the value. `value` stays empty when the
+        /// current value must not be echoed, such as a proxy URL that may carry
+        /// credentials.
+        fn startSettingsEdit(app: *App, command_text: []const u8, value: []const u8) !void {
+            var command: std.Io.Writer.Allocating = .init(app.alloc);
+            defer command.deinit();
+            try command.writer.writeAll(command_text);
+            try command.writer.writeAll(value);
+            var prepared_input = try app.input_runtime.textReplacementState().prepare(
+                app.alloc,
+                command.written(),
+            );
+            defer prepared_input.deinit(app.alloc);
+            app.input_runtime.settings_menu.close();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.input_runtime.textReplacementState().commit(app.alloc, &prepared_input);
+            app.input_runtime.picker.dismissInlinePicker(.slash);
+            app.shell.render_requests.request(.footer);
+        }
+
         fn submitSettingsMenuSelection(app: *App) !bool {
             if (!settingsMenuActive(app)) return false;
             if (comptime @hasField(App, "model_cache")) {
@@ -2539,21 +2562,11 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 }
                 if (selected.id == .login_shell) {
-                    var command: std.Io.Writer.Allocating = .init(app.alloc);
-                    defer command.deinit();
-                    try command.writer.writeAll("/settings login-shell ");
-                    try command.writer.writeAll(selected.value);
-                    var prepared_input = try app.input_runtime.textReplacementState().prepare(
-                        app.alloc,
-                        command.written(),
-                    );
-                    defer prepared_input.deinit(app.alloc);
-                    app.input_runtime.settings_menu.close();
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-                    app.input_runtime.textReplacementState().commit(app.alloc, &prepared_input);
-                    app.input_runtime.picker.dismissInlinePicker(.slash);
-                    app.shell.render_requests.request(.footer);
+                    try startSettingsEdit(app, "/settings login-shell ", selected.value);
+                    return true;
+                }
+                if (selected.id == .proxy) {
+                    try startSettingsEdit(app, "/settings proxy ", "");
                     return true;
                 }
             }
