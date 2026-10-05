@@ -28,8 +28,9 @@ const text_utils = @import("text_utils.zig");
 /// Network surfaces that can be routed independently.
 ///
 /// `children` covers exported proxy environment variables for child processes
-/// (shell, stdio MCP servers, git). It is accepted in `apply_to` but export
-/// wiring is not implemented yet, so it currently has no effect.
+/// (shell commands, stdio MCP servers, skill installs). It is off unless the
+/// user names it, because a child that reads `HTTP_PROXY` may reach a corporate
+/// proxy that local tooling never has to touch.
 pub const Surface = enum { model, mcp, upgrade, children };
 
 /// Default scope of an explicit proxy: model traffic only. MCP, upgrade, and
@@ -157,6 +158,8 @@ const State = struct {
     explicit_origin: Origin = .settings,
     explicit_proxy: ?*std.http.Client.Proxy = null,
     explicit_rules: []const Rule = &.{},
+    /// Bypass entries joined for `NO_PROXY` in child environments.
+    no_proxy_env: ?[]const u8 = null,
     explicit_surfaces: SurfaceSet = SurfaceSet.initEmpty(),
     env_http_proxy: ?*std.http.Client.Proxy = null,
     env_https_proxy: ?*std.http.Client.Proxy = null,
@@ -312,6 +315,9 @@ fn applyExplicit(state: *State, arena: std.mem.Allocator, config: Config) Config
     state.masked_explicit_url = try text_utils.redactUrlForDisplay(arena, url);
     state.explicit_proxy = try buildProxy(arena, state.explicit_url.?);
     state.explicit_rules = try parseRules(arena, config.no_proxy);
+    // Child processes receive the list in its standard comma-separated form,
+    // so the export does not depend on how this build parses rules.
+    state.no_proxy_env = try std.mem.join(arena, ",", config.no_proxy);
     state.explicit_surfaces = surfaceSet(config.apply_to);
 }
 
@@ -497,6 +503,58 @@ pub fn initClient(alloc: std.mem.Allocator, surface: Surface, url: []const u8) s
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     applyToClient(&client, surface, url);
     return client;
+}
+
+/// One variable fx exports to a child process on the `children` surface.
+pub const ChildExport = struct { name: []const u8, value: []const u8 };
+
+/// `childExports` never returns more entries than this.
+pub const max_child_exports = 6;
+
+/// The variables fx exports to a child process on the `children` surface: the
+/// proxy URL as `HTTP_PROXY` and `HTTPS_PROXY` and the bypass list as
+/// `NO_PROXY`, each in both cases so tools that read either one agree. Returns
+/// an empty slice when fx exports nothing, which is the default: an
+/// unconfigured or out-of-scope child inherits the parent environment, and the
+/// standard variables keep working exactly as they do for any other program.
+///
+/// Values are borrowed from the resolution. `buffer` holds `max_child_exports`
+/// entries.
+pub fn childExports(buffer: []ChildExport) []const ChildExport {
+    const state = global_state orelse return &.{};
+    const url = state.explicit_url orelse return &.{};
+    if (!state.explicit_surfaces.contains(.children)) return &.{};
+
+    var count: usize = 0;
+    for ([_][]const u8{ "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy" }) |name| {
+        if (count == buffer.len) break;
+        buffer[count] = .{ .name = name, .value = url };
+        count += 1;
+    }
+    // An empty value is meaningful here: it clears an inherited bypass list so
+    // a child cannot skip a proxy the user selected on purpose.
+    for ([_][]const u8{ "NO_PROXY", "no_proxy" }) |name| {
+        if (count == buffer.len) break;
+        buffer[count] = .{ .name = name, .value = state.no_proxy_env orelse "" };
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+/// Environment for a child process: the parent environment plus `childExports`.
+/// Returns null when fx exports nothing, so the child inherits the parent
+/// environment unchanged. The caller owns a returned map and keeps it alive
+/// until the child is spawned. The URL is exported as configured, credentials
+/// included, because that is how every proxy-aware tool reads a password.
+pub fn childEnvironment(alloc: std.mem.Allocator) io_mod.CloneEnvironMapError!?std.process.Environ.Map {
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    if (exports.len == 0) return null;
+
+    var map = try io_mod.cloneEnvironMap(alloc);
+    errdefer map.deinit();
+    for (exports) |entry| try map.put(entry.name, entry.value);
+    return map;
 }
 
 /// Validates a proxy URL the way resolution will, without installing it.
@@ -825,6 +883,67 @@ test "sourceFor reports where each surface resolves" {
     try testing.expectEqual(Source.none, sourceFor(.model));
     try testing.expect(!environmentConfigured());
     try testing.expectEqualSlices(Surface, &.{}, explicitSurfaces(&buffer));
+}
+
+test "childExports covers the children surface only" {
+    var model_only = try testEnv(&.{
+        .{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model" },
+        .{ "FX_NO_PROXY", ".corp,10.0.0.0/8" },
+    });
+    defer model_only.deinit();
+
+    try initFromEnvMap(&model_only, .{});
+    defer reset();
+    // Model traffic is proxied, but a shell command keeps the parent
+    // environment unless the user asks for the children surface.
+    var buffer: [max_child_exports]ChildExport = undefined;
+    try testing.expectEqual(@as(usize, 0), childExports(&buffer).len);
+
+    var with_children = try testEnv(&.{
+        .{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model,children" },
+        .{ "FX_NO_PROXY", ".corp,10.0.0.0/8" },
+    });
+    defer with_children.deinit();
+    try initFromEnvMap(&with_children, .{});
+
+    const exports = childExports(&buffer);
+    try testing.expectEqual(@as(usize, max_child_exports), exports.len);
+    for (exports[0..4]) |entry| {
+        try testing.expectEqualStrings("http://user:secret@127.0.0.1:8080", entry.value);
+    }
+    try testing.expectEqualStrings("HTTP_PROXY", exports[0].name);
+    try testing.expectEqualStrings("https_proxy", exports[3].name);
+    try testing.expectEqualStrings("NO_PROXY", exports[4].name);
+    try testing.expectEqualStrings(".corp,10.0.0.0/8", exports[4].value);
+    try testing.expectEqualStrings("no_proxy", exports[5].name);
+}
+
+test "childExports stays empty for environment-only and unreachable state" {
+    var env_only = try testEnv(&.{
+        .{ "HTTPS_PROXY", "http://env-proxy.example:3128" },
+        .{ "NO_PROXY", "inherited.example" },
+    });
+    defer env_only.deinit();
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    try initFromEnvMap(&env_only, .{});
+    defer reset();
+    // Child processes already inherit the standard variables, so fx adds
+    // nothing and leaves the inherited bypass list alone.
+    try testing.expectEqual(@as(usize, 0), childExports(&buffer).len);
+
+    try initFromEnvMap(&env_only, .{ .stored = .{
+        .url = "http://127.0.0.1:3128",
+        .no_proxy = &.{},
+        .apply_to = &.{.children},
+    } });
+    const exports = childExports(&buffer);
+    // An empty value is deliberate: it stops the child from bypassing a proxy
+    // the user selected.
+    try testing.expectEqualStrings("", exports[4].value);
+    try testing.expectEqualStrings("", exports[5].value);
 }
 
 test "explicit FX_PROXY applies to model and leaves other surfaces to the environment" {

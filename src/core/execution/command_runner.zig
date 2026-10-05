@@ -14,6 +14,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1108,12 +1109,15 @@ fn executeProcessWithInput(
     closed_input: bool,
     isolate_process_group: bool,
 ) !CollectedProcess {
+    var child_environment = try proxy_mod.childEnvironment(scratch);
+    defer if (child_environment) |*environment| environment.deinit();
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
         .cwd = .{ .path = cwd },
         .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
@@ -1219,12 +1223,15 @@ fn executeProcessWithDetachedSession(
     try helper_argv.append(scratch, deadline_text);
     try helper_argv.appendSlice(scratch, argv);
 
+    var child_environment = try proxy_mod.childEnvironment(scratch);
+    defer if (child_environment) |*environment| environment.deinit();
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
         .cwd = .{ .path = cwd },
     });
 
@@ -1391,12 +1398,15 @@ fn executeProcessWithScriptUnisolated(
     cwd: []const u8,
     script: []const u8,
 ) !CollectedProcess {
+    var child_environment = try proxy_mod.childEnvironment(scratch);
+    defer if (child_environment) |*environment| environment.deinit();
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
         .cwd = .{ .path = cwd },
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
