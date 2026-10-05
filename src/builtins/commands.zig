@@ -372,7 +372,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--proxy <url>",
-        .description = "Send outbound traffic through a proxy such as http://user:pass@127.0.0.1:8080",
+        .description = "Send outbound traffic through an HTTP proxy",
     },
     .{
         .usage = "--no-proxy <a,b,...>",
