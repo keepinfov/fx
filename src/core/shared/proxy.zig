@@ -153,6 +153,8 @@ const State = struct {
     /// `explicit_url` with credentials masked, built with the resolution so
     /// every surface can display it without allocating.
     masked_explicit_url: ?[]const u8 = null,
+    /// Which layer supplied `explicit_url`.
+    explicit_origin: Origin = .settings,
     explicit_proxy: ?*std.http.Client.Proxy = null,
     explicit_rules: []const Rule = &.{},
     explicit_surfaces: SurfaceSet = SurfaceSet.initEmpty(),
@@ -161,6 +163,15 @@ const State = struct {
     env_rules: []const Rule = &.{},
     env_configured: bool = false,
 };
+
+/// Which layer supplied the explicit proxy.
+pub const Origin = enum { flag, environment, settings };
+
+/// The proxy URL stored in the profile with credentials masked, or null when
+/// the profile stores none. `/settings` shows and edits this value, which can
+/// differ from the effective resolution when `FX_PROXY` or `--proxy` wins.
+/// Owned here for the process lifetime.
+var stored_display: ?[]u8 = null;
 
 /// Process-lifetime resolution, installed once at startup before threads that
 /// open connections are spawned. Every field is read-only afterwards, so
@@ -196,6 +207,12 @@ fn initFromEnvMap(environ: *const std.process.Environ.Map, sources: Sources) Con
     return resolveAndInstall(.{ .map = environ }, sources);
 }
 
+/// Clears the process-wide resolution. Tests use this to keep diagnostics
+/// deterministic; production resolves once and keeps the state.
+pub fn resetForTests() void {
+    reset();
+}
+
 /// Releases the process-wide resolution. Only tests need this; production
 /// resolves once and keeps the state for the process lifetime.
 fn reset() void {
@@ -207,6 +224,8 @@ fn reset() void {
         std.heap.page_allocator.destroy(arena);
         flag_arena = null;
     }
+    setStoredDisplay(null) catch {};
+    failure_state = null;
 }
 
 fn destroyState(state: *State) void {
@@ -237,17 +256,26 @@ fn resolveAndInstall(env: EnvSource, sources: Sources) ConfigError!void {
 
     // Explicit configuration, highest priority first: FX_PROXY, then stored
     // profile settings. Flags refine whichever one is selected.
-    var explicit: ?Config = explicitConfigFromEnv(arena, env) orelse sources.stored;
+    const from_environment = explicitConfigFromEnv(arena, env);
+    var explicit: ?Config = from_environment orelse sources.stored;
+    var origin: Origin = if (from_environment != null) .environment else .settings;
     if (override_url) |url| {
         var config: Config = explicit orelse .{ .url = url };
         config.url = url;
         explicit = config;
+        origin = .flag;
     }
     if (explicit) |*config| {
         if (override_no_proxy) |entries| config.no_proxy = entries;
         if (override_apply_to) |surfaces| config.apply_to = surfaces;
+        state.explicit_origin = origin;
         try applyExplicit(state, arena, config.*);
     }
+
+    // The profile value is what `/settings` shows and edits, so refresh its
+    // display copy even when a higher layer wins the effective resolution.
+    try setStoredDisplay(if (sources.stored) |stored| stored.url else null);
+
     try applyEnvironment(state, arena, env);
 
     if (global_state) |previous| destroyState(previous);
@@ -374,12 +402,68 @@ pub fn maskUrl(alloc: std.mem.Allocator, url: []const u8) error{OutOfMemory}![]u
     return text_utils.redactUrlForDisplay(alloc, url);
 }
 
-/// The stored proxy as a single display value: the masked explicit URL, `off`
-/// when nothing explicit is configured, and `off (environment)` when only the
-/// standard variables would route traffic. Borrowed from the resolution.
-pub fn displayValue() []const u8 {
+/// The proxy URL stored in the profile with credentials masked, or null when
+/// the profile stores none. `/settings` shows and edits this value.
+pub fn storedDisplay() ?[]const u8 {
+    return stored_display;
+}
+
+/// Records the profile's proxy URL, masked, for `/settings`. Passing null
+/// clears it. Called by the resolution and by `/settings` after a save, so the
+/// row reflects the saved value without restarting the process.
+pub fn setStoredDisplay(url: ?[]const u8) error{OutOfMemory}!void {
+    const previous = stored_display;
+    stored_display = null;
+    if (previous) |value| std.heap.page_allocator.free(value);
+    if (url) |value| {
+        stored_display = try text_utils.redactUrlForDisplay(std.heap.page_allocator, value);
+    }
+}
+
+/// The effective policy as a single display value: the masked explicit URL,
+/// `environment` when only the standard variables route traffic, else `off`.
+pub fn effectiveDisplay() []const u8 {
     if (maskedExplicitUrl()) |url| return url;
-    return if (environmentConfigured()) "off (environment)" else "off";
+    return if (environmentConfigured()) "environment" else "off";
+}
+
+/// Which layer supplied the explicit proxy, or null when none is configured.
+pub fn explicitOrigin() ?Origin {
+    const state = global_state orelse return null;
+    if (state.explicit_proxy == null) return null;
+    return state.explicit_origin;
+}
+
+/// Display label for `Origin`.
+pub fn originLabel(origin: Origin) []const u8 {
+    return switch (origin) {
+        .flag => "--proxy",
+        .environment => "FX_PROXY",
+        .settings => "settings",
+    };
+}
+
+/// Display label for `Source`.
+pub fn sourceLabel(source: Source) []const u8 {
+    return switch (source) {
+        .explicit => "configured",
+        .environment => "environment",
+        .none => "off",
+    };
+}
+
+var failure_state: ?ConfigError = null;
+
+/// Records a resolution failure the composition root caught instead of
+/// exiting, so a diagnostics command can explain it. No policy is installed,
+/// so every surface stays direct until the configuration is fixed.
+pub fn noteFailure(err: ConfigError) void {
+    failure_state = err;
+}
+
+/// The recorded resolution failure, or null when the last resolution succeeded.
+pub fn failure() ?ConfigError {
+    return failure_state;
 }
 
 /// Applies the process proxy policy to an already-created client. Safe to call

@@ -2804,6 +2804,7 @@ fn statusSnapshotFromStartupWithBuild(
         .session_permission_grants = 0,
         .agent_step_limit = startup.agent_step_limit,
         .login_shell = startup.login_shell,
+        .proxy = output_contracts.ProxySnapshot.fromPolicy(),
         .login_shell_source = switch (startup.login_shell_source) {
             .process_override => "env",
             .user_global => "settings",
@@ -6131,6 +6132,8 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
 }
 
 test "runIfRequested local json success appends exactly one newline" {
+    proxy_mod.resetForTests();
+    defer proxy_mod.resetForTests();
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
@@ -6140,7 +6143,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"proxy\":{\"value\":\"off\",\"url\":null,\"origin\":null,\"surfaces\":{\"model\":\"off\",\"mcp\":\"off\",\"upgrade\":\"off\",\"children\":\"off\"}},\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -6210,6 +6213,8 @@ test "status and doctor inspect MCP configuration once per command" {
 }
 
 test "writeRenderedJsonLine falls back to heap and appends exactly one newline" {
+    proxy_mod.resetForTests();
+    defer proxy_mod.resetForTests();
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
@@ -6229,7 +6234,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"proxy\":{\"value\":\"off\",\"url\":null,\"origin\":null,\"surfaces\":{\"model\":\"off\",\"mcp\":\"off\",\"upgrade\":\"off\",\"children\":\"off\"}},\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }

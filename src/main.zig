@@ -3512,10 +3512,16 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     // direct connection. Profile settings refine this later, once the merged
     // configuration is known.
     proxy_mod.initFromEnvironment() catch |err| {
-        try writeStderrFast("fx: invalid proxy configuration (");
-        try writeStderrFast(@errorName(err));
-        try writeStderrFast(")\n");
-        exitFast(1);
+        // `fx doctor` exists to explain a broken environment, so it keeps
+        // running and reports the failure as a check instead of exiting.
+        if (isDoctorCommand(cli_args)) {
+            proxy_mod.noteFailure(err);
+        } else {
+            try writeStderrFast("fx: invalid proxy configuration (");
+            try writeStderrFast(@errorName(err));
+            try writeStderrFast(")\n");
+            exitFast(1);
+        }
     };
     const auth_mode = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
         try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
@@ -3724,6 +3730,13 @@ fn hasPosixArgVector() bool {
         .wasi => builtin.link_libc,
         else => true,
     };
+}
+
+/// Whether the invocation is `fx doctor`, the one command allowed to run with
+/// a broken proxy configuration so it can explain the failure.
+fn isDoctorCommand(args: []const [:0]const u8) bool {
+    const command = cli_surface.commandAfterGlobalLaunchArgs(args) orelse return false;
+    return std.mem.eql(u8, command, "doctor");
 }
 
 fn needsFullEntryConfig(args: []const [:0]const u8) bool {

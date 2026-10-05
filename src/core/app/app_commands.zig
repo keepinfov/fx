@@ -3979,7 +3979,7 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
     if (comptime @hasField(App, "prompt_history")) snapshot.prompt_history = app.prompt_history.enabled;
     snapshot.login_shell = shell_resolver.configuredLoginShell() orelse "default";
-    snapshot.proxy = proxy_mod.maskedExplicitUrl() orelse "off";
+    snapshot.proxy = proxy_mod.storedDisplay() orelse "off";
     if (comptime @hasDecl(App, "notificationPreferences")) {
         const notifications = app.notificationPreferences();
         snapshot.sound_level = settings_catalog.notificationLevel(

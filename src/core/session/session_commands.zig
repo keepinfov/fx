@@ -314,6 +314,7 @@ pub fn Commands(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .login_shell = login_shell,
                 .login_shell_source = login_shell_source,
+                .proxy = output_contracts.ProxySnapshot.fromPolicy(),
             }).renderInteractiveBody(app.alloc);
             defer app.alloc.free(text);
             try app.writeDomainNotice(.{ .topic = "status", .tone = .neutral, .body = text }, true);
@@ -1011,7 +1012,7 @@ pub fn Commands(comptime App: type) type {
                 app.agent_step_limit,
                 startup_scrollback_label,
                 login_shell,
-                proxy_mod.displayValue(),
+                proxy_mod.storedDisplay() orelse "off",
             });
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
@@ -1182,7 +1183,10 @@ pub fn Commands(comptime App: type) type {
                         try out.writer.writeAll("proxy: off; cleared the stored proxy");
                     }
                     // The resolution is installed once at startup, so a saved
-                    // change reaches connections only after a restart.
+                    // change reaches connections only after a restart. The
+                    // display value follows immediately so `/settings` shows
+                    // what was saved.
+                    proxy_mod.setStoredDisplay(url) catch {};
                     try out.writer.writeAll(" (applies on next launch)");
                     const msg = try out.toOwnedSlice();
                     defer app.alloc.free(msg);

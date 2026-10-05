@@ -501,6 +501,18 @@ pub fn loadStartupStatus(
     );
 }
 
+/// Installs the profile proxy once merged settings are known. Profile settings
+/// rank below per-launch flags and `FX_PROXY`. Commands that do not build the
+/// full app state call this before they open a connection.
+fn initProxyFromSettings(settings: *const config_runtime.Settings) !void {
+    proxy_mod.initResolved(.{
+        .stored = if (settings.proxy) |*proxy| proxy.config() else null,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProfileConfiguration,
+    };
+}
+
 pub fn loadStartupStatusWithAuthMode(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -515,6 +527,7 @@ pub fn loadStartupStatusWithAuthMode(
     var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
+    try initProxyFromSettings(settings);
 
     const run_model = config_runtime.modelEnvOverride();
     const configured_selection = try config_runtime.selectProviderModel(default_model, settings, null, run_model);
@@ -633,14 +646,8 @@ fn loadStartupStateFromOwnedWorkspace(
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
     // The merged settings are known here, before any command opens a
-    // connection, so this is where a configured proxy takes effect. Profile
-    // settings rank below per-launch flags and `FX_PROXY`.
-    proxy_mod.initResolved(.{
-        .stored = if (settings.proxy) |*proxy| proxy.config() else null,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidProfileConfiguration,
-    };
+    // connection, so this is where a configured proxy takes effect.
+    try initProxyFromSettings(settings);
     // A rejected profile cannot safely identify the destination of model data.
     if (auth_mode == .local) for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.layer != .user) continue;
