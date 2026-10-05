@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const system_tools = @import("../shared/system_tools.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -3480,7 +3481,10 @@ test "readiness EOF directly kills and reaps helper pid" {
 test "pre-ready cancellation directly kills and reaps helper pid" {
     if (comptime !supports_foreground_session) return;
 
-    const argv = [_][]const u8{ "/bin/sleep", "2" };
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const argv = [_][]const u8{ sleep_path, "2" };
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
@@ -3502,7 +3506,10 @@ test "pre-ready cancellation directly kills and reaps helper pid" {
 test "pre-ready configured timeout directly kills and reaps helper pid" {
     if (comptime !supports_foreground_session) return;
 
-    const argv = [_][]const u8{ "/bin/sleep", "2" };
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const argv = [_][]const u8{ sleep_path, "2" };
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
@@ -3524,7 +3531,10 @@ test "pre-ready configured timeout directly kills and reaps helper pid" {
 test "foreground session setup has a bounded internal ceiling" {
     if (comptime !supports_foreground_session) return;
 
-    const argv = [_][]const u8{ "/bin/sleep", "7" };
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const argv = [_][]const u8{ sleep_path, "7" };
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const cfg = Config{
