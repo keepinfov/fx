@@ -3366,6 +3366,30 @@ test "foreground session bootstrap invalid release executes no target" {
     try expectRejectedForegroundSessionReleaseForTest(0xff);
 }
 
+/// A host login shell can write decoration of its own: this host's bash emits a
+/// window-title escape from its exit hook. That decoration belongs to the shell
+/// rather than to the target command, and it appears whenever a script calls
+/// `exit`, so measure it with a script that writes nothing and leaves the same
+/// way. The tests below then describe the target's own bytes on any host.
+const ShellDecoration = struct {
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+};
+
+fn measureShellDecoration(
+    alloc: std.mem.Allocator,
+    workspace: []const u8,
+    script: []const u8,
+) !ShellDecoration {
+    const baseline = try executeCommand(.{ .max_command_output_bytes = 4096 }, alloc, script, workspace);
+    defer alloc.free(baseline.output);
+    const result = baseline.command_result.?;
+    return .{
+        .stdout_bytes = result.stdout_bytes,
+        .stderr_bytes = result.stderr_bytes,
+    };
+}
+
 test "foreground session protocol bytes do not enter captured output" {
     if (comptime !supports_foreground_session) return;
 
@@ -3390,6 +3414,7 @@ test "target replacement marker prefix remains ordinary stderr" {
     if (comptime !supports_foreground_session) return;
 
     const stderr_text = foreground_session_replace_failure_prefix ++ "target-data\n";
+    const decoration = try measureShellDecoration(std.testing.allocator, "/tmp", "exit 125");
     const result = try executeCommand(.{
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, "printf '\\000FX_FOREGROUND_EXEC_FAILED:target-data\\n' >&2; exit 125", "/tmp");
@@ -3397,8 +3422,8 @@ test "target replacement marker prefix remains ordinary stderr" {
 
     const foreground = result.command_result.?;
     try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), foreground.stdout_bytes);
-    try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
+    try std.testing.expect(foreground.stdout_bytes <= decoration.stdout_bytes);
+    try std.testing.expectEqual(decoration.stderr_bytes + stderr_text.len, foreground.stderr_bytes);
     try std.testing.expect(std.mem.find(u8, result.output, stderr_text) != null);
 }
 
@@ -4180,6 +4205,7 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
         .needle = "CANCEL-READY",
     };
     const expected = "HEAD-1234567890-TAIL\nCANCEL-READY\n";
+    const decoration = try measureShellDecoration(alloc, workspace, "exit 0");
     const result = try executeCommand(.{
         .max_command_output_bytes = 16,
         .cancel_flag = &cancel,
@@ -4193,15 +4219,18 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
     try std.testing.expect(result.cancelled);
     const foreground = result.command_result.?;
     try std.testing.expect(foreground.truncated);
-    try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
+    try std.testing.expect(foreground.stdout_bytes >= expected.len);
+    try std.testing.expect(foreground.stdout_bytes <= expected.len + decoration.stdout_bytes);
+    try std.testing.expectEqual(decoration.stderr_bytes, foreground.stderr_bytes);
     try std.testing.expect(std.mem.find(u8, result.output, "truncated=true\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "bytes truncated") != null);
 
     const output_path = foreground.output_file orelse return error.TestExpectedEqual;
     const artifact = try readAbsoluteFile(alloc, output_path, 256);
     defer alloc.free(artifact);
-    try std.testing.expectEqualStrings(expected, artifact);
+    try std.testing.expect(artifact.len >= expected.len);
+    try std.testing.expectEqualStrings(expected, artifact[0..expected.len]);
+    try std.testing.expect(artifact.len - expected.len <= decoration.stdout_bytes);
 }
 
 test "cancelled managed command confirms an indeterminate artifact target" {
@@ -4323,6 +4352,7 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
     const term_tail = "TERM-TAIL-ONLY\n";
     const expected = ready ++ term_tail;
     const cap = 128;
+    const decoration = try measureShellDecoration(alloc, workspace, "exit 0");
     try std.testing.expect(expected.len > streamPreviewLimit(cap));
     try std.testing.expect(expected.len <= cap);
 
@@ -4342,12 +4372,15 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
 
     const foreground = result.command_result.?;
     try std.testing.expect(!foreground.truncated);
-    try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
+    try std.testing.expect(foreground.stdout_bytes >= expected.len);
+    try std.testing.expect(foreground.stdout_bytes <= expected.len + decoration.stdout_bytes);
+    try std.testing.expectEqual(decoration.stderr_bytes, foreground.stderr_bytes);
     const output_path = foreground.output_file orelse return error.TestExpectedEqual;
     const artifact = try readAbsoluteFile(alloc, output_path, 256);
     defer alloc.free(artifact);
-    try std.testing.expectEqualStrings(expected, artifact);
+    try std.testing.expect(artifact.len >= expected.len);
+    try std.testing.expectEqualStrings(expected, artifact[0..expected.len]);
+    try std.testing.expect(artifact.len - expected.len <= decoration.stdout_bytes);
 }
 
 test "zero-output cancellation remains a bare error" {
