@@ -9,6 +9,7 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
@@ -631,6 +632,15 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
+    // The merged settings are known here, before any command opens a
+    // connection, so this is where a configured proxy takes effect. Profile
+    // settings rank below per-launch flags and `FX_PROXY`.
+    proxy_mod.initResolved(.{
+        .stored = if (settings.proxy) |*proxy| proxy.config() else null,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProfileConfiguration,
+    };
     // A rejected profile cannot safely identify the destination of model data.
     if (auth_mode == .local) for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.layer != .user) continue;

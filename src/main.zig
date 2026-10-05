@@ -3509,8 +3509,9 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     const alloc = processAllocator();
     // Resolve the outbound proxy policy once, before any command can open a
     // connection. A configured-but-broken proxy is fatal rather than a silent
-    // direct connection.
-    proxy_mod.initFromEnvironment(alloc) catch |err| {
+    // direct connection. Profile settings refine this later, once the merged
+    // configuration is known.
+    proxy_mod.initFromEnvironment() catch |err| {
         try writeStderrFast("fx: invalid proxy configuration (");
         try writeStderrFast(@errorName(err));
         try writeStderrFast(")\n");
