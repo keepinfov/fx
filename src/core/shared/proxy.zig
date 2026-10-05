@@ -52,6 +52,43 @@ pub const Config = struct {
 
 pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, OutOfMemory };
 
+/// Explicit configuration layers, highest priority first. `override` carries
+/// per-launch flags, `stored` carries profile settings after the config
+/// runtime merged workspace and profile layers. `FX_PROXY` sits between them
+/// and the standard environment fallback.
+pub const Sources = struct {
+    override: ?Config = null,
+    stored: ?Config = null,
+};
+
+/// A `proxy` block from `settings.json`. Owns its strings and lists.
+pub const StoredConfig = struct {
+    url: []const u8,
+    /// Null keeps `default_no_proxy`.
+    no_proxy: ?[]const []const u8 = null,
+    /// Null keeps `default_apply_to`.
+    apply_to: ?[]const Surface = null,
+
+    pub fn deinit(self: *StoredConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.url);
+        if (self.no_proxy) |entries| {
+            for (entries) |entry| alloc.free(@constCast(entry));
+            alloc.free(entries);
+        }
+        if (self.apply_to) |surfaces| alloc.free(surfaces);
+        self.* = undefined;
+    }
+
+    /// Borrowed resolution view; valid while this value lives.
+    pub fn config(self: *const StoredConfig) Config {
+        return .{
+            .url = self.url,
+            .no_proxy = self.no_proxy orelse default_no_proxy,
+            .apply_to = self.apply_to orelse default_apply_to,
+        };
+    }
+};
+
 const Rule = union(enum) {
     all,
     /// Exact host or boundary suffix match, lowercased, without a leading dot.
@@ -93,17 +130,18 @@ const EnvSource = struct {
     }
 };
 
-/// Installs the explicit configuration from `config` and the standard
-/// environment fallback from the real process environment. Called once by the
-/// composition root; a later call replaces the previous resolution.
-pub fn init(alloc: std.mem.Allocator, config: ?Config) ConfigError!void {
-    return install(alloc, .{}, config);
+/// Installs the explicit configuration from flags and profile settings, with
+/// `FX_PROXY` in between and the standard environment as the fallback for
+/// surfaces without an explicit setting. Called once by the composition root;
+/// a later call replaces the previous resolution.
+pub fn initResolved(alloc: std.mem.Allocator, sources: Sources) ConfigError!void {
+    return resolveAndInstall(alloc, .{}, sources);
 }
 
-/// Installs the environment-driven configuration: `FX_PROXY` and its
+/// Installs the environment-driven configuration only: `FX_PROXY` and its
 /// companions when present, otherwise the standard proxy variables alone.
 pub fn initFromEnvironment(alloc: std.mem.Allocator) ConfigError!void {
-    return installFromEnvironment(alloc, .{});
+    return resolveAndInstall(alloc, .{}, .{});
 }
 
 /// Test and embedder entry point: reads the same variables as
@@ -111,8 +149,9 @@ pub fn initFromEnvironment(alloc: std.mem.Allocator) ConfigError!void {
 fn initFromEnvMap(
     alloc: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
+    sources: Sources,
 ) ConfigError!void {
-    return installFromEnvironment(alloc, .{ .map = environ });
+    return resolveAndInstall(alloc, .{ .map = environ }, sources);
 }
 
 /// Releases the process-wide resolution. Only tests need this; production
@@ -134,28 +173,20 @@ fn newState(alloc: std.mem.Allocator) ConfigError!*State {
     return state;
 }
 
-fn installFromEnvironment(alloc: std.mem.Allocator, env: EnvSource) ConfigError!void {
+fn resolveAndInstall(alloc: std.mem.Allocator, env: EnvSource, sources: Sources) ConfigError!void {
     const state = try newState(alloc);
     errdefer destroyState(state);
     // The private arena owns the whole resolution, including the config
     // entries parsed out of the environment.
     const arena = state.arena.allocator();
 
-    if (explicitConfigFromEnv(arena, env)) |config| {
+    if (sources.override) |config| {
+        try applyExplicit(state, arena, config);
+    } else if (explicitConfigFromEnv(arena, env)) |config| {
+        try applyExplicit(state, arena, config);
+    } else if (sources.stored) |config| {
         try applyExplicit(state, arena, config);
     }
-    try applyEnvironment(state, arena, env);
-
-    if (global_state) |previous| destroyState(previous);
-    global_state = state;
-}
-
-fn install(alloc: std.mem.Allocator, env: EnvSource, config: ?Config) ConfigError!void {
-    const state = try newState(alloc);
-    errdefer destroyState(state);
-    const arena = state.arena.allocator();
-
-    if (config) |value| try applyExplicit(state, arena, value);
     try applyEnvironment(state, arena, env);
 
     if (global_state) |previous| destroyState(previous);
@@ -269,6 +300,13 @@ pub fn initClient(alloc: std.mem.Allocator, surface: Surface, url: []const u8) s
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     applyToClient(&client, surface, url);
     return client;
+}
+
+/// Validates a proxy URL the way resolution will, without installing it.
+pub fn validateUrl(alloc: std.mem.Allocator, url: []const u8) ConfigError!void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    _ = try buildProxy(arena.allocator(), url);
 }
 
 const Target = struct { host: []const u8, port: u16 };
@@ -558,7 +596,7 @@ test "maskedExplicitUrl hides credentials" {
     var map = try testEnv(&.{.{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" }});
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     const masked = (try maskedExplicitUrl(arena.allocator())).?;
@@ -573,7 +611,7 @@ test "explicit FX_PROXY applies to model and leaves other surfaces to the enviro
     });
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var model = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/v4/ai/language-model");
@@ -592,7 +630,7 @@ test "default no_proxy keeps loopback providers direct" {
     var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var local = initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/chat/completions");
@@ -612,7 +650,7 @@ test "an explicit empty bypass list routes loopback through the proxy" {
     });
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var local = initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/models");
@@ -628,7 +666,7 @@ test "FX_PROXY_APPLY_TO scopes the explicit proxy" {
     });
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var model = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
@@ -644,7 +682,7 @@ test "standard environment alone is honored on every surface" {
     var map = try testEnv(&.{.{ "HTTPS_PROXY", "http://env-proxy.example:3128" }});
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
@@ -656,11 +694,64 @@ test "standard environment alone is honored on every surface" {
     try testing.expect(upgrade.https_proxy != null);
 }
 
+test "source priority: flags override FX_PROXY, which overrides stored settings" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
+    defer map.deinit();
+
+    const stored: Config = .{ .url = "http://127.0.0.1:9999" };
+    try initFromEnvMap(testing.allocator, &map, .{
+        .override = .{ .url = "http://127.0.0.1:1111" },
+        .stored = stored,
+    });
+    defer reset();
+
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 1111), client.https_proxy.?.port);
+}
+
+test "stored settings apply when neither flags nor FX_PROXY are present" {
+    var map = try testEnv(&.{});
+    defer map.deinit();
+
+    const stored: Config = .{ .url = "http://127.0.0.1:9999" };
+    try initFromEnvMap(testing.allocator, &map, .{ .stored = stored });
+    defer reset();
+
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 9999), client.https_proxy.?.port);
+
+    // A surface outside `apply_to` still has no explicit setting.
+    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer mcp.deinit();
+    try testing.expect(mcp.https_proxy == null);
+}
+
+test "StoredConfig owns and frees its lists" {
+    const alloc = testing.allocator;
+    const entries = try alloc.alloc([]const u8, 2);
+    entries[0] = try alloc.dupe(u8, "localhost");
+    entries[1] = try alloc.dupe(u8, ".corp");
+    const surfaces = try alloc.alloc(Surface, 1);
+    surfaces[0] = .mcp;
+    var stored: StoredConfig = .{
+        .url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .no_proxy = entries,
+        .apply_to = surfaces,
+    };
+    const view = stored.config();
+    try testing.expectEqualStrings("http://127.0.0.1:8080", view.url);
+    try testing.expectEqualStrings(".corp", view.no_proxy[1]);
+    try testing.expectEqual(Surface.mcp, view.apply_to[0]);
+    stored.deinit(alloc);
+}
+
 test "an unrepresentable standard proxy variable is skipped instead of failing startup" {
     var map = try testEnv(&.{.{ "ALL_PROXY", "socks5://127.0.0.1:1080" }});
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var client = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
@@ -677,7 +768,7 @@ test "NO_PROXY from the environment bypasses the environment proxy" {
     });
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var bypassed = initClient(testing.allocator, .mcp, "https://mcp.internal/sse");
@@ -693,7 +784,7 @@ test "an invalid explicit proxy is an error rather than a silent direct connecti
     var map = try testEnv(&.{.{ "FX_PROXY", "socks5://127.0.0.1:1080" }});
     defer map.deinit();
 
-    try testing.expectError(error.UnsupportedProxyScheme, initFromEnvMap(testing.allocator, &map));
+    try testing.expectError(error.UnsupportedProxyScheme, initFromEnvMap(testing.allocator, &map, .{}));
     defer reset();
 
     // Nothing was installed, so the process does not pretend to be proxied.
@@ -704,7 +795,7 @@ test "absent configuration leaves every client direct" {
     var map = try testEnv(&.{});
     defer map.deinit();
 
-    try initFromEnvMap(testing.allocator, &map);
+    try initFromEnvMap(testing.allocator, &map, .{});
     defer reset();
 
     var client = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");

@@ -3,6 +3,7 @@ const agent_steps = @import("agent_steps.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -81,8 +82,12 @@ pub const Settings = struct {
     /// Owned absolute directories whose contents symlinked skills may resolve
     /// into. Profile-only; a later layer replaces the whole list. Freed in deinit.
     skill_symlink_authorities: ?[][]u8 = null,
+    /// Outbound proxy block. Profile-only; a later layer replaces it whole.
+    /// Freed in deinit.
+    proxy: ?proxy_mod.StoredConfig = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.proxy) |*proxy| proxy.deinit(alloc);
         if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
@@ -835,6 +840,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "permission",
         "additional_directories",
         "skill_symlink_authorities",
+        "proxy",
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
     }
@@ -1779,6 +1785,12 @@ fn parseProfileOnlyFields(
         settings.skill_symlink_authorities = paths;
     }
 
+    if (root.object.get("proxy")) |proxy_value| {
+        const parsed = try parseProxySettings(alloc, proxy_value);
+        if (settings.proxy) |*old| old.deinit(alloc);
+        settings.proxy = parsed;
+    }
+
     if (root.object.get("prompt_history")) |prompt_history_value| {
         if (prompt_history_value != .object) return error.InvalidPromptHistoryType;
         if (prompt_history_value.object.get("enabled")) |enabled| {
@@ -1983,6 +1995,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         target.skill_symlink_authorities = value;
         incoming.skill_symlink_authorities = null;
     }
+    if (incoming.proxy) |value| {
+        if (target.proxy) |*old| old.deinit(alloc);
+        target.proxy = value;
+        incoming.proxy = null;
+    }
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
     if (incoming.review_model) |value| {
@@ -2005,6 +2022,53 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         target.has_permission_rules = true;
         incoming.has_permission_rules = false;
     }
+}
+
+fn parseProxySettings(alloc: Allocator, value: std.json.Value) !proxy_mod.StoredConfig {
+    if (value != .object) return error.InvalidProxyType;
+    const url_value = value.object.get("url") orelse return error.ProxyUrlRequired;
+    if (url_value != .string) return error.InvalidProxyUrlType;
+    const url = std.mem.trim(u8, url_value.string, " \t\r\n");
+    if (url.len == 0) return error.InvalidProxyUrlValue;
+    proxy_mod.validateUrl(alloc, url) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProxyUrlValue,
+    };
+
+    var parsed: proxy_mod.StoredConfig = .{ .url = try alloc.dupe(u8, url) };
+    errdefer parsed.deinit(alloc);
+
+    if (value.object.get("no_proxy")) |no_proxy_value| {
+        parsed.no_proxy = try parseProxyNoProxy(alloc, no_proxy_value);
+    }
+    if (value.object.get("apply_to")) |apply_value| {
+        if (apply_value != .array) return error.InvalidProxyApplyToType;
+        const surfaces = try alloc.alloc(proxy_mod.Surface, apply_value.array.items.len);
+        errdefer alloc.free(surfaces);
+        for (apply_value.array.items, 0..) |item, index| {
+            if (item != .string) return error.InvalidProxyApplyToEntry;
+            surfaces[index] = std.meta.stringToEnum(proxy_mod.Surface, item.string) orelse
+                return error.InvalidProxyApplyToValue;
+        }
+        parsed.apply_to = surfaces;
+    }
+    return parsed;
+}
+
+fn parseProxyNoProxy(alloc: Allocator, value: std.json.Value) ![]const []const u8 {
+    if (value != .array) return error.InvalidProxyNoProxyType;
+    const entries = try alloc.alloc([]const u8, value.array.items.len);
+    var count: usize = 0;
+    errdefer {
+        for (entries[0..count]) |entry| alloc.free(@constCast(entry));
+        alloc.free(entries);
+    }
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidProxyNoProxyEntry;
+        entries[count] = try alloc.dupe(u8, std.mem.trim(u8, item.string, " \t\r\n"));
+        count += 1;
+    }
+    return entries;
 }
 
 fn parsePermissionConfig(alloc: Allocator, value: std.json.Value) !types.PermissionRuleSet {
@@ -4751,4 +4815,38 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
     try std.testing.expect(std.mem.find(u8, configured, "`fx provider add <name> --model <id>`") != null);
     try std.testing.expect(std.mem.find(u8, configured, "--model or FX_MODEL") != null);
     try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
+}
+
+test "proxy parses replaces on merge and rejects invalid entries" {
+    const alloc = std.testing.allocator;
+
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.proxy == null);
+
+    var first = try parseSettingsJson(alloc,
+        \\{"proxy":{"url":"http://127.0.0.1:8080","no_proxy":[".corp","10.0.0.0/8"],"apply_to":["model","mcp"]}}
+    );
+    defer first.deinit(alloc);
+    const parsed = first.proxy.?;
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", parsed.url);
+    try std.testing.expectEqual(@as(usize, 2), parsed.no_proxy.?.len);
+    try std.testing.expectEqualStrings(".corp", parsed.no_proxy.?[0]);
+    try std.testing.expectEqualSlices(proxy_mod.Surface, &.{ .model, .mcp }, parsed.apply_to.?);
+
+    var second = try parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"https://proxy.example:3128\"}}");
+    defer second.deinit(alloc);
+    try mergeSettings(&first, &second, alloc);
+    try std.testing.expectEqualStrings("https://proxy.example:3128", first.proxy.?.url);
+    try std.testing.expect(first.proxy.?.no_proxy == null);
+
+    try std.testing.expectError(error.InvalidProxyType, parseSettingsJson(alloc, "{\"proxy\":\"http://127.0.0.1:8080\"}"));
+    try std.testing.expectError(error.ProxyUrlRequired, parseSettingsJson(alloc, "{\"proxy\":{\"no_proxy\":[]}}"));
+    try std.testing.expectError(error.InvalidProxyUrlValue, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"socks5://127.0.0.1:1080\"}}"));
+    try std.testing.expectError(error.InvalidProxyApplyToValue, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"apply_to\":[\"web\"]}}"));
+    try std.testing.expectError(error.InvalidProxyNoProxyEntry, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"no_proxy\":[7]}}"));
+}
+
+test "proxy is a profile-only setting key" {
+    try std.testing.expect(isProfileOnlySettingKey("proxy"));
 }
