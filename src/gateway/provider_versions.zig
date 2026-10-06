@@ -86,7 +86,7 @@ const LookupOperation = struct {
     url: []const u8,
 
     pub fn run(self: *LookupOperation) !Response {
-        var client = proxy_mod.initClient(self.alloc, .model, self.url);
+        var client = try proxy_mod.initClient(self.alloc, .model, self.url);
         defer client.deinit();
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);

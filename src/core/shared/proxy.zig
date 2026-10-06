@@ -82,6 +82,17 @@ pub const Config = struct {
 
 pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, InvalidProxyApplyTo, OutOfMemory };
 
+/// Refusals a transport factory reports before any socket exists.
+///
+/// `std.http.Client` cannot upgrade a CONNECT tunnel to TLS: `connectProxied`
+/// dials the proxy with the proxy's own protocol, so an `https://` origin
+/// reached through an `http://` proxy is written inside the tunnel as plaintext
+/// and the proxy can read the origin credentials and the request body. No
+/// configuration of the client's proxy fields avoids that, and silently going
+/// direct would bypass the proxy the user configured. Until an app-owned
+/// CONNECT tunnel with origin TLS lands, the combination fails closed here.
+pub const TransportError = error{ProxiedHttpsUnsupported};
+
 /// Explicit configuration layers, highest priority first. `override_*` carry
 /// per-launch flags, `stored` carries profile settings after the config
 /// runtime merged workspace and profile layers. `FX_PROXY` sits between them
@@ -547,15 +558,24 @@ pub fn failure() ?ConfigError {
 /// Applies the process proxy policy to an already-created client. Safe to call
 /// when no proxy is configured; `url` is the request target whose host decides
 /// bypass matching. Read-only: no allocation, no locking, any thread.
-pub fn applyToClient(client: *std.http.Client, surface: Surface, url: []const u8) void {
+///
+/// Returns `error.ProxiedHttpsUnsupported` without touching the client when an
+/// `https://` origin would travel through a proxy. See `TransportError`.
+pub fn applyToClient(client: *std.http.Client, surface: Surface, url: []const u8) TransportError!void {
     const state = global_state orelse return;
     if (surface == .children) return;
 
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     const target = targetOf(url, &host_buffer) orelse return;
 
+    if (target.tls) {
+        // The origin request must be encrypted end to end, which std cannot do
+        // once a proxy owns the socket. Refuse instead of downgrading.
+        if (selectProxy(state, surface, true, target.host, target.port) != null)
+            return error.ProxiedHttpsUnsupported;
+        return;
+    }
     if (selectProxy(state, surface, false, target.host, target.port)) |proxy| client.http_proxy = proxy;
-    if (selectProxy(state, surface, true, target.host, target.port)) |proxy| client.https_proxy = proxy;
 }
 
 /// One proxy endpoint a transport that dials its own sockets can connect to.
@@ -606,10 +626,12 @@ fn selectProxy(state: *const State, surface: Surface, target_tls: bool, host: []
 }
 
 /// The single client factory: a fresh client carrying the policy for
-/// `surface` and the host of `url`.
-pub fn initClient(alloc: std.mem.Allocator, surface: Surface, url: []const u8) std.http.Client {
+/// `surface` and the host of `url`. Fails closed instead of handing back a
+/// client that would carry an `https://` origin request through a proxy as
+/// plaintext.
+pub fn initClient(alloc: std.mem.Allocator, surface: Surface, url: []const u8) TransportError!std.http.Client {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    applyToClient(&client, surface, url);
+    try applyToClient(&client, surface, url);
     return client;
 }
 
@@ -672,13 +694,17 @@ pub fn validateUrl(alloc: std.mem.Allocator, url: []const u8) ConfigError!void {
     _ = try buildProxy(arena.allocator(), url, null);
 }
 
-const Target = struct { host: []const u8, port: u16 };
+const Target = struct { host: []const u8, port: u16, tls: bool };
 
 fn targetOf(url: []const u8, buffer: *[std.Io.net.HostName.max_len]u8) ?Target {
     const uri = std.Uri.parse(url) catch return null;
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
     const host = uri.getHost(buffer) catch return null;
-    return .{ .host = host.bytes, .port = uri.port orelse defaultPort(protocol) };
+    return .{
+        .host = host.bytes,
+        .port = uri.port orelse defaultPort(protocol),
+        .tls = protocol == .tls,
+    };
 }
 
 fn defaultPort(protocol: std.http.Client.Protocol) u16 {
@@ -1279,16 +1305,15 @@ test "explicit FX_PROXY applies to model and leaves other surfaces to the enviro
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var model = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/v4/ai/language-model");
-    defer model.deinit();
-    try testing.expect(model.https_proxy != null);
-    try testing.expectEqualStrings("127.0.0.1", model.https_proxy.?.host.bytes);
-    try testing.expectEqual(@as(u16, 8080), model.https_proxy.?.port);
+    // Selection is observable through `endpointFor`; the client factory
+    // additionally refuses an HTTPS origin through a proxy, which the
+    // "refused" test below covers on its own.
+    const model = endpointFor(.model, true, "ai-gateway.vercel.sh", 443).?;
+    try testing.expectEqualStrings("127.0.0.1", model.host);
+    try testing.expectEqual(@as(u16, 8080), model.port);
 
-    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
-    defer mcp.deinit();
-    try testing.expect(mcp.https_proxy != null);
-    try testing.expectEqualStrings("env-proxy.example", mcp.https_proxy.?.host.bytes);
+    const mcp = endpointFor(.mcp, true, "mcp.example.com", 443).?;
+    try testing.expectEqualStrings("env-proxy.example", mcp.host);
 }
 
 test "default no_proxy keeps loopback providers direct" {
@@ -1298,12 +1323,12 @@ test "default no_proxy keeps loopback providers direct" {
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var local = initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/chat/completions");
+    var local = try initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/chat/completions");
     defer local.deinit();
     try testing.expect(local.http_proxy == null);
     try testing.expect(local.https_proxy == null);
 
-    var named = initClient(testing.allocator, .model, "http://localhost:11434/v1/models");
+    var named = try initClient(testing.allocator, .model, "http://localhost:11434/v1/models");
     defer named.deinit();
     try testing.expect(named.http_proxy == null);
 }
@@ -1318,7 +1343,7 @@ test "an explicit empty bypass list routes loopback through the proxy" {
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var local = initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/models");
+    var local = try initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/models");
     defer local.deinit();
     try testing.expect(local.http_proxy != null);
     try testing.expectEqualStrings("127.0.0.1", local.http_proxy.?.host.bytes);
@@ -1334,13 +1359,17 @@ test "FX_PROXY_APPLY_TO scopes the explicit proxy" {
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var model = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
+    // Model is outside the explicit scope and has no environment fallback, so
+    // it stays direct. Upgrade is in scope, so a proxy applies to its HTTPS
+    // origin and the request is refused rather than downgraded.
+    var model = try initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
     defer model.deinit();
     try testing.expect(model.https_proxy == null);
 
-    var upgrade = initClient(testing.allocator, .upgrade, "https://api.github.com/repos/vercel-labs/fx/releases");
-    defer upgrade.deinit();
-    try testing.expect(upgrade.https_proxy != null);
+    try testing.expectError(
+        error.ProxiedHttpsUnsupported,
+        initClient(testing.allocator, .upgrade, "https://api.github.com/repos/vercel-labs/fx/releases"),
+    );
 }
 
 test "standard environment alone is honored on every surface" {
@@ -1350,13 +1379,11 @@ test "standard environment alone is honored on every surface" {
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
-    defer mcp.deinit();
-    try testing.expect(mcp.https_proxy != null);
+    const mcp = endpointFor(.mcp, true, "mcp.example.com", 443).?;
+    try testing.expectEqualStrings("env-proxy.example", mcp.host);
 
-    var upgrade = initClient(testing.allocator, .upgrade, "https://api.github.com/repos/vercel-labs/fx/releases");
-    defer upgrade.deinit();
-    try testing.expect(upgrade.https_proxy != null);
+    const upgrade = endpointFor(.upgrade, true, "api.github.com", 443).?;
+    try testing.expectEqualStrings("env-proxy.example", upgrade.host);
 }
 
 test "source priority: flags override FX_PROXY, which overrides stored settings" {
@@ -1370,9 +1397,8 @@ test "source priority: flags override FX_PROXY, which overrides stored settings"
     });
     defer reset();
 
-    var client = initClient(testing.allocator, .model, "https://example.com/");
-    defer client.deinit();
-    try testing.expectEqual(@as(u16, 1111), client.https_proxy.?.port);
+    const client = endpointFor(.model, true, "example.com", 443).?;
+    try testing.expectEqual(@as(u16, 1111), client.port);
 }
 
 test "stored settings apply when neither flags nor FX_PROXY are present" {
@@ -1383,14 +1409,11 @@ test "stored settings apply when neither flags nor FX_PROXY are present" {
     try initFromEnvMap(&map, .{ .stored = stored });
     defer reset();
 
-    var client = initClient(testing.allocator, .model, "https://example.com/");
-    defer client.deinit();
-    try testing.expectEqual(@as(u16, 9999), client.https_proxy.?.port);
+    const client = endpointFor(.model, true, "example.com", 443).?;
+    try testing.expectEqual(@as(u16, 9999), client.port);
 
     // A surface outside `apply_to` still has no explicit setting.
-    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
-    defer mcp.deinit();
-    try testing.expect(mcp.https_proxy == null);
+    try testing.expect(endpointFor(.mcp, true, "mcp.example.com", 443) == null);
 }
 
 test "flag overrides refine the selected explicit configuration" {
@@ -1401,18 +1424,13 @@ test "flag overrides refine the selected explicit configuration" {
     defer reset();
 
     try initFromEnvMap(&map, .{});
-    var client = initClient(testing.allocator, .model, "https://example.com/");
-    defer client.deinit();
-    try testing.expectEqual(@as(u16, 2222), client.https_proxy.?.port);
+    const client = endpointFor(.model, true, "example.com", 443).?;
+    try testing.expectEqual(@as(u16, 2222), client.port);
 
-    var bypassed = initClient(testing.allocator, .model, "https://api.corp/v1/models");
-    defer bypassed.deinit();
-    try testing.expect(bypassed.https_proxy == null);
+    try testing.expect(endpointFor(.model, true, "api.corp", 443) == null);
 
     // The scope is the flag's, so a surface outside it stays on the fallback.
-    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
-    defer mcp.deinit();
-    try testing.expect(mcp.https_proxy == null);
+    try testing.expect(endpointFor(.mcp, true, "mcp.example.com", 443) == null);
 }
 
 test "a flag url applies with no other configuration present" {
@@ -1423,9 +1441,8 @@ test "a flag url applies with no other configuration present" {
     defer reset();
 
     try initFromEnvMap(&map, .{});
-    var client = initClient(testing.allocator, .model, "https://example.com/");
-    defer client.deinit();
-    try testing.expectEqual(@as(u16, 3333), client.https_proxy.?.port);
+    const client = endpointFor(.model, true, "example.com", 443).?;
+    try testing.expectEqual(@as(u16, 3333), client.port);
 }
 
 test "an explicit url is copied so its parsed host outlives the caller buffer" {
@@ -1439,10 +1456,9 @@ test "an explicit url is copied so its parsed host outlives the caller buffer" {
     defer reset();
     testing.allocator.free(caller_buffer);
 
-    var client = initClient(testing.allocator, .model, "https://example.com/");
-    defer client.deinit();
-    try testing.expectEqualStrings("127.0.0.1", client.https_proxy.?.host.bytes);
-    try testing.expectEqual(@as(u16, 8080), client.https_proxy.?.port);
+    const client = endpointFor(.model, true, "example.com", 443).?;
+    try testing.expectEqualStrings("127.0.0.1", client.host);
+    try testing.expectEqual(@as(u16, 8080), client.port);
 }
 
 test "StoredConfig owns and frees its lists" {
@@ -1471,7 +1487,7 @@ test "an unrepresentable standard proxy variable is skipped instead of failing s
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var client = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
+    var client = try initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
     defer client.deinit();
     try testing.expect(client.http_proxy == null);
     try testing.expect(client.https_proxy == null);
@@ -1488,13 +1504,37 @@ test "NO_PROXY from the environment bypasses the environment proxy" {
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var bypassed = initClient(testing.allocator, .mcp, "https://mcp.internal/sse");
+    try testing.expect(endpointFor(.mcp, true, "mcp.internal", 443) == null);
+    try testing.expectEqualStrings(
+        "env-proxy.example",
+        endpointFor(.mcp, true, "mcp.example.com", 443).?.host,
+    );
+}
+
+test "an https origin through a proxy is refused instead of sent as plaintext" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    // std.http.Client cannot establish TLS to the origin after CONNECT, so the
+    // request would travel inside the tunnel in the clear. Nothing may be sent.
+    try testing.expectError(
+        error.ProxiedHttpsUnsupported,
+        initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/v4/ai/language-model"),
+    );
+
+    // The plain-HTTP forward path keeps working.
+    var plain = try initClient(testing.allocator, .model, "http://origin.example/v1/models");
+    defer plain.deinit();
+    try testing.expectEqualStrings("127.0.0.1", plain.http_proxy.?.host.bytes);
+    try testing.expect(plain.https_proxy == null);
+
+    // A bypassed HTTPS target stays direct instead of being refused.
+    var bypassed = try initClient(testing.allocator, .model, "https://127.0.0.1:11434/v1/models");
     defer bypassed.deinit();
     try testing.expect(bypassed.https_proxy == null);
-
-    var proxied = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
-    defer proxied.deinit();
-    try testing.expect(proxied.https_proxy != null);
 }
 
 test "an invalid explicit proxy is an error rather than a silent direct connection" {
@@ -1515,7 +1555,7 @@ test "absent configuration leaves every client direct" {
     try initFromEnvMap(&map, .{});
     defer reset();
 
-    var client = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
+    var client = try initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
     defer client.deinit();
     try testing.expect(client.http_proxy == null);
     try testing.expect(client.https_proxy == null);

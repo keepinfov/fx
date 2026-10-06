@@ -357,7 +357,7 @@ fn sendReview(
         }
     }
 
-    var client = proxy_mod.initClient(alloc, .model, config.endpoint);
+    var client = try proxy_mod.initClient(alloc, .model, config.endpoint);
     defer client.deinit();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();

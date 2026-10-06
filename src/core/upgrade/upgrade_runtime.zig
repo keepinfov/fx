@@ -212,7 +212,7 @@ fn upgradeWorkerInner(
     const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(archive_url);
 
-    var client = proxy_mod.initClient(alloc, .upgrade, archive_url);
+    var client = try proxy_mod.initClient(alloc, .upgrade, archive_url);
     defer client.deinit();
 
     helpers.downloadFileStreamingWithProgress(&client, archive_url, archive_path, .{

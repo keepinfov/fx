@@ -2211,7 +2211,7 @@ fn request(
     {
         return error.InsecureMcpAuthEndpoint;
     }
-    var client = proxy_mod.initClient(alloc, .mcp, url);
+    var client = try proxy_mod.initClient(alloc, .mcp, url);
     defer client.deinit();
     var http_request = try client.request(method, uri, .{
         .redirect_behavior = .unhandled,

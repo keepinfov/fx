@@ -79,7 +79,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
         .dev => blk: {
             const url = try std.fmt.allocPrint(alloc, "{s}/dev.json", .{base_url});
             defer alloc.free(url);
-            var client = proxy_mod.initClient(alloc, .upgrade, url);
+            var client = try proxy_mod.initClient(alloc, .upgrade, url);
             defer client.deinit();
             const manifest = try fetchTextBounded(
                 &client,
@@ -97,7 +97,7 @@ pub fn fetchTarget(alloc: Allocator, channel: Channel, base_url: []const u8, con
 fn fetchLatestVersion(alloc: Allocator, base_url: []const u8, control: TransferControl) ![]u8 {
     const url = try std.fmt.allocPrint(alloc, "{s}/latest.txt", .{base_url});
     defer alloc.free(url);
-    var client = proxy_mod.initClient(alloc, .upgrade, url);
+    var client = try proxy_mod.initClient(alloc, .upgrade, url);
     defer client.deinit();
 
     const raw = try fetchTextBounded(

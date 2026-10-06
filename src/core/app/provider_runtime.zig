@@ -29,7 +29,15 @@ pub const Runtime = struct {
     pub fn ensureGatewayHttpPool(self: *Self, url: []const u8) void {
         if (self.gateway_http_pool != null) return;
         const pool = self.alloc.create(http_pool.HttpPool) catch return;
-        pool.* = http_pool.HttpPool.initForUrl(self.alloc, .model, url);
+        pool.* = http_pool.HttpPool.initForUrl(self.alloc, .model, url) catch |err| switch (err) {
+            // An HTTPS model endpoint behind a proxy has no safe std path yet.
+            // Leaving the pool absent keeps the typed failure on the request
+            // that needs it instead of turning it into a startup crash.
+            error.ProxiedHttpsUnsupported => {
+                self.alloc.destroy(pool);
+                return;
+            },
+        };
         self.gateway_http_pool = pool;
     }
 
