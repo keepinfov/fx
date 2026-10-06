@@ -127,7 +127,7 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, `permission`, `login_shell`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, `permission`, `login_shell`, `proxy`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
 
 `skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 

@@ -12,6 +12,7 @@ const std = @import("std");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const proxy_mod = @import("../../core/shared/proxy.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
@@ -356,7 +357,7 @@ fn sendReview(
         }
     }
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .model, config.endpoint);
     defer client.deinit();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();

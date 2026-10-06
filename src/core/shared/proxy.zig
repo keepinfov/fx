@@ -1,0 +1,1523 @@
+//! Outbound proxy policy for fx.
+//!
+//! One process-wide resolution decides whether a network surface may use a
+//! proxy, and a per-client factory applies it to `std.http.Client`. std owns
+//! the transport: `Client.http_proxy` / `Client.https_proxy` hold `*Proxy`
+//! values that must outlive the client, and std implements the CONNECT tunnel
+//! and the plain absolute-form request path. std has no `no_proxy` concept at
+//! all, so bypass matching (host, suffix, host:port, `*`, IP, CIDR) lives here.
+//!
+//! Policy, highest priority first:
+//!   1. an explicit surface scope (`apply_to`), resolved once at startup from
+//!      `FX_PROXY` today and from profile settings once those land;
+//!   2. standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY`,
+//!      applied to every surface that has no explicit setting. This mirrors
+//!      std's own `initDefaultProxies` lists so the environment keeps behaving
+//!      the way it does for curl and git;
+//!   3. no proxy.
+//!
+//! Fail closed: when a proxy is selected for a surface, the client is never
+//! silently downgraded to a direct connection. Only an explicit bypass entry
+//! produces a direct client. A proxy that is configured but unreachable
+//! surfaces the transport error instead of a direct retry.
+
+const std = @import("std");
+const io_mod = @import("io.zig");
+const text_utils = @import("text_utils.zig");
+
+/// Network surfaces that can be routed independently.
+///
+/// `children` covers exported proxy environment variables for child processes
+/// (shell commands, stdio MCP servers, skill installs). It is off unless the
+/// user names it, because a child that reads `HTTP_PROXY` may reach a corporate
+/// proxy that local tooling never has to touch.
+///
+/// `web` covers `web_fetch`, which resolves and dials its own sockets so a
+/// target cannot slip past the public-address policy. `web_search` runs at the
+/// model provider and stays on `model`.
+pub const Surface = enum { model, mcp, upgrade, children, web };
+
+/// Default scope of an explicit proxy: model traffic only. MCP, upgrade, child
+/// processes, and web fetches keep using the standard environment fallback.
+pub const default_apply_to = &[_]Surface{.model};
+
+/// Number of surfaces, so callers can size a buffer without hardcoding it.
+pub const max_surfaces = std.meta.fields(Surface).len;
+
+/// Every surface, in declaration order.
+pub const all_surfaces: [max_surfaces]Surface = blk: {
+    var list: [max_surfaces]Surface = undefined;
+    for (std.meta.tags(Surface), 0..) |tag, index| list[index] = tag;
+    break :blk list;
+};
+
+/// The surfaces one `apply_to` entry selects, or null when the name selects
+/// none. `all` selects every surface.
+pub fn surfacesForName(name: []const u8) ?[]const Surface {
+    if (std.mem.eql(u8, name, "all")) return &all_surfaces;
+    const surface = std.meta.stringToEnum(Surface, name) orelse return null;
+    return switch (surface) {
+        inline else => |named| &[_]Surface{named},
+    };
+}
+
+/// Loopback names and addresses are never sent to an explicitly configured
+/// proxy unless the list is replaced. Local model servers (Ollama, LM Studio,
+/// vLLM) and local MCP servers are plain loopback traffic, and routing them
+/// through a corporate proxy breaks them without adding any security.
+pub const default_no_proxy = &[_][]const u8{ "localhost", "127.0.0.1", "::1" };
+
+pub const Config = struct {
+    /// Proxy URL, for example `http://user:pass@127.0.0.1:8080`.
+    url: []const u8,
+    /// Bypass entries. Empty slice means "nothing bypasses".
+    no_proxy: []const []const u8 = default_no_proxy,
+    apply_to: []const Surface = default_apply_to,
+    /// Name of an environment variable that holds the proxy password. When it
+    /// resolves, it wins over a password in `url`, which keeps the secret out
+    /// of the profile and out of the process command line. The user still comes
+    /// from `url`.
+    password_env: ?[]const u8 = null,
+};
+
+pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, InvalidProxyApplyTo, OutOfMemory };
+
+/// Explicit configuration layers, highest priority first. `override_*` carry
+/// per-launch flags, `stored` carries profile settings after the config
+/// runtime merged workspace and profile layers. `FX_PROXY` sits between them
+/// and the standard environment fallback. Each override refines the selected
+/// explicit configuration, so `--proxy` alone changes only the URL and
+/// `--no-proxy` alone changes only the bypass list.
+pub const Sources = struct {
+    override_url: ?[]const u8 = null,
+    override_no_proxy: ?[]const []const u8 = null,
+    override_apply_to: ?[]const Surface = null,
+    stored: ?Config = null,
+};
+
+/// Per-launch flags, registered by the CLI surface as soon as they parse and
+/// long before the first resolution. Copies are owned here for the process
+/// lifetime, exactly like the resolution itself, because the CLI's own
+/// argument storage does not outlive the command.
+var flag_layer: FlagLayer = .{};
+var flag_arena: ?*std.heap.ArenaAllocator = null;
+
+const FlagLayer = struct {
+    url: ?[]const u8 = null,
+    no_proxy: ?[]const []const u8 = null,
+    apply_to: ?[]const Surface = null,
+};
+
+/// Registers `--proxy` / `--no-proxy` / `--proxy-apply-to`. Passing null for
+/// every field clears the layer.
+pub fn setFlagOverrides(
+    url: ?[]const u8,
+    no_proxy: ?[]const []const u8,
+    apply_to: ?[]const Surface,
+) ConfigError!void {
+    if (flag_arena == null) {
+        const created = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
+        created.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        flag_arena = created;
+    }
+    const arena = flag_arena.?.allocator();
+    const previous = flag_layer;
+    flag_layer = .{};
+    errdefer flag_layer = previous;
+
+    if (url) |value| flag_layer.url = try arena.dupe(u8, value);
+    if (no_proxy) |entries| {
+        const copied = try arena.alloc([]const u8, entries.len);
+        for (entries, 0..) |entry, index| copied[index] = try arena.dupe(u8, entry);
+        flag_layer.no_proxy = copied;
+    }
+    if (apply_to) |surfaces| flag_layer.apply_to = try arena.dupe(Surface, surfaces);
+}
+
+/// A `proxy` block from `settings.json`. Owns its strings and lists.
+pub const StoredConfig = struct {
+    url: []const u8,
+    /// Null keeps `default_no_proxy`.
+    no_proxy: ?[]const []const u8 = null,
+    /// Null keeps `default_apply_to`.
+    apply_to: ?[]const Surface = null,
+    /// Environment variable that holds the password, or null.
+    password_env: ?[]const u8 = null,
+
+    pub fn deinit(self: *StoredConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.url);
+        if (self.no_proxy) |entries| {
+            for (entries) |entry| alloc.free(@constCast(entry));
+            alloc.free(entries);
+        }
+        if (self.apply_to) |surfaces| alloc.free(surfaces);
+        if (self.password_env) |name| alloc.free(@constCast(name));
+        self.* = undefined;
+    }
+
+    /// Borrowed resolution view; valid while this value lives.
+    pub fn config(self: *const StoredConfig) Config {
+        return .{
+            .url = self.url,
+            .no_proxy = self.no_proxy orelse default_no_proxy,
+            .apply_to = self.apply_to orelse default_apply_to,
+            .password_env = self.password_env,
+        };
+    }
+};
+
+const Rule = union(enum) {
+    all,
+    /// Exact host or boundary suffix match, lowercased, without a leading dot.
+    host: []const u8,
+    host_port: HostPortRule,
+    cidr4: Cidr4,
+    cidr6: Cidr6,
+
+    const HostPortRule = struct { host: []const u8, port: u16 };
+    const Cidr4 = struct { addr: [4]u8, bits: u6 };
+    const Cidr6 = struct { addr: [16]u8, bits: u7 };
+};
+
+const SurfaceSet = std.EnumSet(Surface);
+
+const State = struct {
+    arena: std.heap.ArenaAllocator,
+    explicit_url: ?[]const u8 = null,
+    /// `explicit_url` with credentials masked, built with the resolution so
+    /// every surface can display it without allocating.
+    masked_explicit_url: ?[]const u8 = null,
+    /// The URL child processes receive. It equals `explicit_url` unless
+    /// `password_env` supplied a password, which is inserted here so a child
+    /// tool can authenticate the way it always has.
+    explicit_child_url: ?[]const u8 = null,
+    /// Which layer supplied `explicit_url`.
+    explicit_origin: Origin = .settings,
+    explicit_proxy: ?*std.http.Client.Proxy = null,
+    explicit_rules: []const Rule = &.{},
+    /// Bypass entries joined for `NO_PROXY` in child environments.
+    no_proxy_env: ?[]const u8 = null,
+    explicit_surfaces: SurfaceSet = SurfaceSet.initEmpty(),
+    /// The password variable the explicit configuration names, and whether it
+    /// supplied a value. Diagnostics and child export only.
+    explicit_password_env: ?[]const u8 = null,
+    explicit_password_resolved: bool = false,
+    env_http_proxy: ?*std.http.Client.Proxy = null,
+    env_https_proxy: ?*std.http.Client.Proxy = null,
+    env_rules: []const Rule = &.{},
+    env_configured: bool = false,
+};
+
+/// Which layer supplied the explicit proxy.
+pub const Origin = enum { flag, environment, settings };
+
+/// The proxy URL stored in the profile with credentials masked, or null when
+/// the profile stores none. `/settings` shows and edits this value, which can
+/// differ from the effective resolution when `FX_PROXY` or `--proxy` wins.
+/// Owned here for the process lifetime.
+var stored_display: ?[]u8 = null;
+
+/// Process-lifetime resolution, installed once at startup before threads that
+/// open connections are spawned. Every field is read-only afterwards, so
+/// `applyToClient` never allocates and is safe to call from any thread.
+var global_state: ?*State = null;
+
+const EnvSource = struct {
+    map: ?*const std.process.Environ.Map = null,
+
+    fn get(self: EnvSource, key: []const u8) ?[]const u8 {
+        if (self.map) |map| return map.get(key);
+        return io_mod.getenv(key);
+    }
+};
+
+/// Installs the explicit configuration from flags and profile settings, with
+/// `FX_PROXY` in between and the standard environment as the fallback for
+/// surfaces without an explicit setting. Called once by the composition root;
+/// a later call replaces the previous resolution.
+pub fn initResolved(sources: Sources) ConfigError!void {
+    return resolveAndInstall(.{}, sources);
+}
+
+/// Installs the environment-driven configuration only: `FX_PROXY` and its
+/// companions when present, otherwise the standard proxy variables alone.
+pub fn initFromEnvironment() ConfigError!void {
+    return resolveAndInstall(.{}, .{});
+}
+
+/// Test and embedder entry point: reads the same variables as
+/// `initFromEnvironment` but from `environ` instead of the process block.
+fn initFromEnvMap(environ: *const std.process.Environ.Map, sources: Sources) ConfigError!void {
+    return resolveAndInstall(.{ .map = environ }, sources);
+}
+
+/// Clears the process-wide resolution. Tests use this to keep diagnostics
+/// deterministic; production resolves once and keeps the state.
+pub fn resetForTests() void {
+    reset();
+}
+
+/// Releases the process-wide resolution. Only tests need this; production
+/// resolves once and keeps the state for the process lifetime.
+fn reset() void {
+    if (global_state) |state| destroyState(state);
+    global_state = null;
+    flag_layer = .{};
+    if (flag_arena) |arena| {
+        arena.deinit();
+        std.heap.page_allocator.destroy(arena);
+        flag_arena = null;
+    }
+    setStoredDisplay(null) catch {};
+    failure_state = null;
+}
+
+fn destroyState(state: *State) void {
+    const child_allocator = state.arena.child_allocator;
+    state.arena.deinit();
+    child_allocator.destroy(state);
+}
+
+/// The resolution outlives every caller, so it is allocated from a dedicated
+/// process-lifetime allocator rather than one owned by a caller that may only
+/// live for a command or a test.
+fn newState() ConfigError!*State {
+    const state = try std.heap.page_allocator.create(State);
+    state.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    return state;
+}
+
+fn resolveAndInstall(env: EnvSource, sources: Sources) ConfigError!void {
+    const state = try newState();
+    errdefer destroyState(state);
+    // The private arena owns the whole resolution, including the config
+    // entries parsed out of the environment.
+    const arena = state.arena.allocator();
+
+    const override_url = sources.override_url orelse flag_layer.url;
+    const override_no_proxy = sources.override_no_proxy orelse flag_layer.no_proxy;
+    const override_apply_to = sources.override_apply_to orelse flag_layer.apply_to;
+
+    // Explicit configuration, highest priority first: FX_PROXY, then stored
+    // profile settings. Flags refine whichever one is selected.
+    const from_environment = try explicitConfigFromEnv(arena, env);
+    var explicit: ?Config = from_environment orelse sources.stored;
+    var origin: Origin = if (from_environment != null) .environment else .settings;
+    if (override_url) |url| {
+        var config: Config = explicit orelse .{ .url = url };
+        config.url = url;
+        explicit = config;
+        origin = .flag;
+    }
+    if (explicit) |*config| {
+        if (override_no_proxy) |entries| config.no_proxy = entries;
+        if (override_apply_to) |surfaces| config.apply_to = surfaces;
+        state.explicit_origin = origin;
+        try applyExplicit(state, arena, config.*, resolvePassword(env, config.password_env));
+    }
+
+    // The profile value is what `/settings` shows and edits, so refresh its
+    // display copy even when a higher layer wins the effective resolution.
+    try setStoredDisplay(if (sources.stored) |stored| stored.url else null);
+
+    try applyEnvironment(state, arena, env);
+
+    if (global_state) |previous| destroyState(previous);
+    global_state = state;
+}
+
+fn explicitConfigFromEnv(arena: std.mem.Allocator, env: EnvSource) ConfigError!?Config {
+    const raw_url = env.get("FX_PROXY") orelse return null;
+    const url = std.mem.trim(u8, raw_url, " \t\r\n");
+    if (url.len == 0) return null;
+
+    const no_proxy = if (env.get("FX_NO_PROXY")) |raw|
+        try splitList(arena, raw)
+    else
+        default_no_proxy;
+
+    // A name that selects no surface is an error: silently dropping it would
+    // leave traffic on a direct connection while the user believes otherwise.
+    const apply_to = if (env.get("FX_PROXY_APPLY_TO")) |raw| blk: {
+        const parsed = try splitList(arena, raw);
+        const surfaces = try surfaceList(arena, parsed);
+        break :blk if (surfaces.len == 0) default_apply_to else surfaces;
+    } else default_apply_to;
+
+    return .{ .url = url, .no_proxy = no_proxy, .apply_to = apply_to };
+}
+
+/// Reads the named password variable. A missing or empty value means the URL
+/// itself supplies the password, which keeps a stale variable from silently
+/// stripping credentials the user already configured.
+fn resolvePassword(env: EnvSource, name: ?[]const u8) ?[]const u8 {
+    const key = name orelse return null;
+    const value = env.get(key) orelse return null;
+    if (value.len == 0) return null;
+    return value;
+}
+
+fn applyExplicit(state: *State, arena: std.mem.Allocator, config: Config, password: ?[]const u8) ConfigError!void {
+    const url = std.mem.trim(u8, config.url, " \t\r\n");
+    if (url.len == 0) return;
+    // Build the proxy from the arena copy, never from the caller's buffer:
+    // std keeps pointers into the URL (its host may alias the input string)
+    // for the lifetime of the client, and a caller that owns that buffer, such
+    // as the parsed settings JSON, may free it long before the last request.
+    state.explicit_url = try arena.dupe(u8, url);
+    state.masked_explicit_url = try text_utils.redactUrlForDisplay(arena, url);
+    state.explicit_proxy = try buildProxy(arena, state.explicit_url.?, password);
+    state.explicit_rules = try parseRules(arena, config.no_proxy);
+    // Child processes receive the list in its standard comma-separated form,
+    // so the export does not depend on how this build parses rules.
+    state.no_proxy_env = try std.mem.join(arena, ",", config.no_proxy);
+    state.explicit_surfaces = surfaceSet(config.apply_to);
+    state.explicit_password_env = if (config.password_env) |name| try arena.dupe(u8, name) else null;
+    state.explicit_password_resolved = password != null;
+    // Every proxy-aware tool reads a password from the URL, so a child gets the
+    // resolved password even when fx itself keeps it in a variable.
+    state.explicit_child_url = if (password) |secret|
+        try urlWithPassword(arena, state.explicit_url.?, secret)
+    else
+        state.explicit_url.?;
+}
+
+fn applyEnvironment(state: *State, arena: std.mem.Allocator, env: EnvSource) ConfigError!void {
+    // A missing environment block is not fatal: the process then behaves as it
+    // did before proxy support existed and opens direct connections.
+    var map = if (env.map) |provided|
+        provided.clone(arena) catch return
+    else
+        io_mod.cloneEnvironMap(arena) catch return;
+
+    state.env_rules = try parseRules(arena, try splitList(arena, map.get("NO_PROXY") orelse map.get("no_proxy") orelse ""));
+    state.env_http_proxy = try envProxy(arena, map, &.{ "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY" });
+    state.env_https_proxy = try envProxy(arena, map, &.{ "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY" });
+    state.env_configured = state.env_http_proxy != null or state.env_https_proxy != null;
+}
+
+/// The standard variable lists std itself reads. A value std cannot represent,
+/// such as a `socks5://` endpoint, is skipped rather than failing startup:
+/// foreign proxy variables must not keep fx from running.
+fn envProxy(
+    arena: std.mem.Allocator,
+    map: std.process.Environ.Map,
+    names: []const []const u8,
+) ConfigError!?*std.http.Client.Proxy {
+    for (names) |name| {
+        const value = map.get(name) orelse continue;
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        return buildProxy(arena, trimmed, null) catch continue;
+    }
+    return null;
+}
+
+/// Where a surface's policy comes from. Diagnostics only: the exact per-request
+/// decision also depends on the request host and the bypass list.
+pub const Source = enum { explicit, environment, none };
+
+/// The source that governs `surface`. A surface inside the explicit scope never
+/// falls back to the standard environment, because an explicit bypass entry
+/// means a direct connection. `children` inherits the standard variables from
+/// the parent environment even when fx exports nothing of its own.
+pub fn sourceFor(surface: Surface) Source {
+    const state = global_state orelse return .none;
+    if (state.explicit_proxy != null and state.explicit_surfaces.contains(surface)) return .explicit;
+    return if (state.env_configured) .environment else .none;
+}
+
+/// Whether `surface` resolves to a proxy at all. Diagnostics only: the exact
+/// per-request decision also depends on the request host.
+pub fn isEnabled(surface: Surface) bool {
+    return sourceFor(surface) != .none;
+}
+
+/// The surfaces an explicit proxy covers, in declaration order. Empty when no
+/// explicit proxy is configured. Borrowed from the resolution; the returned
+/// slice is valid for the process lifetime.
+pub fn explicitSurfaces(buffer: []Surface) []const Surface {
+    const state = global_state orelse return &.{};
+    if (state.explicit_proxy == null) return &.{};
+    var count: usize = 0;
+    for (std.meta.tags(Surface)) |surface| {
+        if (count == buffer.len) break;
+        if (!state.explicit_surfaces.contains(surface)) continue;
+        buffer[count] = surface;
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+/// Whether the standard proxy variables provide a fallback for surfaces without
+/// an explicit setting.
+pub fn environmentConfigured() bool {
+    const state = global_state orelse return false;
+    return state.env_configured;
+}
+
+/// The password variable the explicit configuration names, and whether it
+/// supplied a value. Diagnostics only: `fx doctor` warns about a name that
+/// resolves to nothing, because fx then falls back to a passwordless URL.
+pub const PasswordEnv = struct { name: []const u8, resolved: bool };
+
+pub fn passwordEnv() ?PasswordEnv {
+    const state = global_state orelse return null;
+    const name = state.explicit_password_env orelse return null;
+    return .{ .name = name, .resolved = state.explicit_password_resolved };
+}
+
+/// The explicit proxy URL with credentials masked, or null when no explicit
+/// proxy is configured. Borrowed from the resolution; the returned slice is
+/// valid for the process lifetime.
+pub fn maskedExplicitUrl() ?[]const u8 {
+    const state = global_state orelse return null;
+    return state.masked_explicit_url;
+}
+
+/// Masks credentials in one proxy URL for display. Caller owns the memory.
+pub fn maskUrl(alloc: std.mem.Allocator, url: []const u8) error{OutOfMemory}![]u8 {
+    return text_utils.redactUrlForDisplay(alloc, url);
+}
+
+/// The proxy URL stored in the profile with credentials masked, or null when
+/// the profile stores none. `/settings` shows and edits this value.
+pub fn storedDisplay() ?[]const u8 {
+    return stored_display;
+}
+
+/// Records the profile's proxy URL, masked, for `/settings`. Passing null
+/// clears it. Called by the resolution and by `/settings` after a save, so the
+/// row reflects the saved value without restarting the process.
+pub fn setStoredDisplay(url: ?[]const u8) error{OutOfMemory}!void {
+    const previous = stored_display;
+    stored_display = null;
+    if (previous) |value| std.heap.page_allocator.free(value);
+    if (url) |value| {
+        stored_display = try text_utils.redactUrlForDisplay(std.heap.page_allocator, value);
+    }
+}
+
+/// The effective policy as a single display value: the masked explicit URL,
+/// `environment` when only the standard variables route traffic, else `off`.
+pub fn effectiveDisplay() []const u8 {
+    if (maskedExplicitUrl()) |url| return url;
+    return if (environmentConfigured()) "environment" else "off";
+}
+
+/// Which layer supplied the explicit proxy, or null when none is configured.
+pub fn explicitOrigin() ?Origin {
+    const state = global_state orelse return null;
+    if (state.explicit_proxy == null) return null;
+    return state.explicit_origin;
+}
+
+/// Display label for `Origin`.
+pub fn originLabel(origin: Origin) []const u8 {
+    return switch (origin) {
+        .flag => "--proxy",
+        .environment => "FX_PROXY",
+        .settings => "settings",
+    };
+}
+
+/// Display label for `Source`.
+pub fn sourceLabel(source: Source) []const u8 {
+    return switch (source) {
+        .explicit => "configured",
+        .environment => "environment",
+        .none => "off",
+    };
+}
+
+var failure_state: ?ConfigError = null;
+
+/// Records a resolution failure the composition root caught instead of
+/// exiting, so a diagnostics command can explain it. No policy is installed,
+/// so every surface stays direct until the configuration is fixed.
+pub fn noteFailure(err: ConfigError) void {
+    failure_state = err;
+}
+
+/// The recorded resolution failure, or null when the last resolution succeeded.
+pub fn failure() ?ConfigError {
+    return failure_state;
+}
+
+/// Applies the process proxy policy to an already-created client. Safe to call
+/// when no proxy is configured; `url` is the request target whose host decides
+/// bypass matching. Read-only: no allocation, no locking, any thread.
+pub fn applyToClient(client: *std.http.Client, surface: Surface, url: []const u8) void {
+    const state = global_state orelse return;
+    if (surface == .children) return;
+
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const target = targetOf(url, &host_buffer) orelse return;
+
+    if (selectProxy(state, surface, false, target.host, target.port)) |proxy| client.http_proxy = proxy;
+    if (selectProxy(state, surface, true, target.host, target.port)) |proxy| client.https_proxy = proxy;
+}
+
+/// One proxy endpoint a transport that dials its own sockets can connect to.
+/// Every field is borrowed from the process resolution.
+pub const Endpoint = struct {
+    host: []const u8,
+    port: u16,
+    /// Whether the endpoint itself speaks TLS, which an `https://` proxy URL
+    /// requests.
+    tls: bool,
+    /// Value for a `Proxy-Authorization` header, credentials included.
+    authorization: ?[]const u8,
+};
+
+/// The proxy one target must be dialed through, or null when the target is
+/// dialed directly. `target_tls` selects the standard variable that supplies
+/// the environment fallback, matching how `std.http.Client` reads `HTTP_PROXY`
+/// and `HTTPS_PROXY`. Read-only: no allocation, no locking, any thread.
+pub fn endpointFor(surface: Surface, target_tls: bool, host: []const u8, port: u16) ?Endpoint {
+    const state = global_state orelse return null;
+    const proxy = selectProxy(state, surface, target_tls, host, port) orelse return null;
+    return .{
+        .host = proxy.host.bytes,
+        .port = proxy.port,
+        .tls = proxy.protocol == .tls,
+        .authorization = proxy.authorization,
+    };
+}
+
+/// Precedence shared by every surface: an explicit proxy in scope wins, and a
+/// bypass entry for the target means a direct connection rather than a fallback
+/// to the standard variables. Only a surface outside the explicit scope reaches
+/// `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+fn selectProxy(state: *const State, surface: Surface, target_tls: bool, host: []const u8, port: u16) ?*std.http.Client.Proxy {
+    if (surface == .children) return null;
+
+    if (state.explicit_proxy) |proxy| {
+        if (state.explicit_surfaces.contains(surface)) {
+            if (ruleMatches(state.explicit_rules, host, port)) return null;
+            return proxy;
+        }
+    }
+
+    const environment = if (target_tls) state.env_https_proxy else state.env_http_proxy;
+    const proxy = environment orelse return null;
+    if (ruleMatches(state.env_rules, host, port)) return null;
+    return proxy;
+}
+
+/// The single client factory: a fresh client carrying the policy for
+/// `surface` and the host of `url`.
+pub fn initClient(alloc: std.mem.Allocator, surface: Surface, url: []const u8) std.http.Client {
+    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    applyToClient(&client, surface, url);
+    return client;
+}
+
+/// One variable fx exports to a child process on the `children` surface.
+pub const ChildExport = struct { name: []const u8, value: []const u8 };
+
+/// `childExports` never returns more entries than this.
+pub const max_child_exports = 6;
+
+/// The variables fx exports to a child process on the `children` surface: the
+/// proxy URL as `HTTP_PROXY` and `HTTPS_PROXY` and the bypass list as
+/// `NO_PROXY`, each in both cases so tools that read either one agree. Returns
+/// an empty slice when fx exports nothing, which is the default: an
+/// unconfigured or out-of-scope child inherits the parent environment, and the
+/// standard variables keep working exactly as they do for any other program.
+///
+/// Values are borrowed from the resolution. `buffer` holds `max_child_exports`
+/// entries.
+pub fn childExports(buffer: []ChildExport) []const ChildExport {
+    const state = global_state orelse return &.{};
+    const url = state.explicit_child_url orelse return &.{};
+    if (!state.explicit_surfaces.contains(.children)) return &.{};
+
+    var count: usize = 0;
+    for ([_][]const u8{ "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy" }) |name| {
+        if (count == buffer.len) break;
+        buffer[count] = .{ .name = name, .value = url };
+        count += 1;
+    }
+    // An empty value is meaningful here: it clears an inherited bypass list so
+    // a child cannot skip a proxy the user selected on purpose.
+    for ([_][]const u8{ "NO_PROXY", "no_proxy" }) |name| {
+        if (count == buffer.len) break;
+        buffer[count] = .{ .name = name, .value = state.no_proxy_env orelse "" };
+        count += 1;
+    }
+    return buffer[0..count];
+}
+
+/// Environment for a child process: the parent environment plus `childExports`.
+/// Returns null when fx exports nothing, so the child inherits the parent
+/// environment unchanged. The caller owns a returned map and keeps it alive
+/// until the child is spawned. The URL is exported as configured, credentials
+/// included, because that is how every proxy-aware tool reads a password.
+pub fn childEnvironment(alloc: std.mem.Allocator) io_mod.CloneEnvironMapError!?std.process.Environ.Map {
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    if (exports.len == 0) return null;
+
+    var map = try io_mod.cloneEnvironMap(alloc);
+    errdefer map.deinit();
+    for (exports) |entry| try map.put(entry.name, entry.value);
+    return map;
+}
+
+/// Validates a proxy URL the way resolution will, without installing it.
+pub fn validateUrl(alloc: std.mem.Allocator, url: []const u8) ConfigError!void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    _ = try buildProxy(arena.allocator(), url, null);
+}
+
+const Target = struct { host: []const u8, port: u16 };
+
+fn targetOf(url: []const u8, buffer: *[std.Io.net.HostName.max_len]u8) ?Target {
+    const uri = std.Uri.parse(url) catch return null;
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+    const host = uri.getHost(buffer) catch return null;
+    return .{ .host = host.bytes, .port = uri.port orelse defaultPort(protocol) };
+}
+
+fn defaultPort(protocol: std.http.Client.Protocol) u16 {
+    return switch (protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+}
+
+/// A URL without `://` is an authority with an implicit `http` scheme, so
+/// `127.0.0.1:8080` and `user:pass@host:8080` work. An explicit unknown scheme
+/// is rejected instead of being guessed at.
+fn parseProxyUri(arena: std.mem.Allocator, raw_url: []const u8) ConfigError!std.Uri {
+    if (std.mem.find(u8, raw_url, "://") != null) {
+        return std.Uri.parse(raw_url) catch error.InvalidProxyUrl;
+    }
+    const with_scheme = try std.fmt.allocPrint(arena, "http://{s}", .{raw_url});
+    return std.Uri.parse(with_scheme) catch error.InvalidProxyUrl;
+}
+
+/// `raw_url` with `password` as its password, percent-encoded so the result is
+/// still one URL. This is what child processes receive: every proxy-aware tool
+/// reads a password from the URL, and the child environment is not a file or a
+/// command line the user has to keep the secret out of.
+fn urlWithPassword(arena: std.mem.Allocator, raw_url: []const u8, password: []const u8) ConfigError![]const u8 {
+    const uri = try parseProxyUri(arena, raw_url);
+    const scheme = uri.scheme;
+    const host = uri.getHostAlloc(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProxyUrl,
+    };
+    const host_name = host.bytes;
+    if (host_name.len == 0) return error.InvalidProxyUrl;
+    // getHostAlloc keeps the brackets of a literal host, so only a bare
+    // colon-separated host still needs them.
+    const bracketed = host_name.len > 0 and host_name[0] == '[';
+    const ipv6 = !bracketed and std.mem.findScalar(u8, host_name, ':') != null;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    const user: std.Uri.Component = uri.user orelse .empty;
+    out.writer.print("{s}://{f}:{f}@{s}{s}{s}", .{
+        scheme,
+        std.fmt.alt(user, .formatUser),
+        std.fmt.alt(std.Uri.Component{ .raw = password }, .formatPassword),
+        if (ipv6) "[" else "",
+        host_name,
+        if (ipv6) "]" else "",
+    }) catch return error.OutOfMemory;
+    if (uri.port) |port| out.writer.print(":{d}", .{port}) catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
+fn buildProxy(arena: std.mem.Allocator, raw_url: []const u8, password: ?[]const u8) ConfigError!*std.http.Client.Proxy {
+    const uri = try parseProxyUri(arena, raw_url);
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedProxyScheme;
+    const host = uri.getHostAlloc(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProxyUrl,
+    };
+    // A password from the environment replaces the one in the URL, so the
+    // profile can store `http://user@proxy` and the secret stays in the
+    // environment. The user still comes from the URL.
+    var credential_uri = uri;
+    if (password != null) credential_uri.password = .{ .raw = password.? };
+
+    const authorization: ?[]const u8 = if (credential_uri.user != null or credential_uri.password != null) blk: {
+        const buffer = try arena.alloc(u8, std.http.Client.basic_authorization.valueLengthFromUri(credential_uri));
+        const written = std.http.Client.basic_authorization.value(credential_uri, buffer);
+        if (written.len != buffer.len) return error.InvalidProxyUrl;
+        break :blk buffer;
+    } else null;
+
+    const proxy = try arena.create(std.http.Client.Proxy);
+    proxy.* = .{
+        .protocol = protocol,
+        .host = host,
+        .authorization = authorization,
+        .port = uri.port orelse defaultPort(protocol),
+        .supports_connect = true,
+    };
+    return proxy;
+}
+
+fn splitList(arena: std.mem.Allocator, raw: []const u8) ConfigError![]const []const u8 {
+    var entries: std.ArrayList([]const u8) = .empty;
+    var iterator = std.mem.splitScalar(u8, raw, ',');
+    while (iterator.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try entries.append(arena, trimmed);
+    }
+    return entries.toOwnedSlice(arena);
+}
+
+fn surfaceList(arena: std.mem.Allocator, names: []const []const u8) ConfigError![]const Surface {
+    var surfaces: std.ArrayList(Surface) = .empty;
+    errdefer surfaces.deinit(arena);
+    for (names) |name| {
+        const expanded = surfacesForName(name) orelse return error.InvalidProxyApplyTo;
+        for (expanded) |surface| {
+            if (std.mem.findScalar(Surface, surfaces.items, surface) != null) continue;
+            try surfaces.append(arena, surface);
+        }
+    }
+    return surfaces.toOwnedSlice(arena);
+}
+
+fn surfaceSet(surfaces: []const Surface) SurfaceSet {
+    var set = SurfaceSet.initEmpty();
+    for (surfaces) |surface| set.insert(surface);
+    return set;
+}
+
+fn parseRules(arena: std.mem.Allocator, entries: []const []const u8) ConfigError![]const Rule {
+    var rules: std.ArrayList(Rule) = .empty;
+    for (entries) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.eql(u8, trimmed, "*")) {
+            try rules.append(arena, .all);
+            continue;
+        }
+        if (std.mem.findScalar(u8, trimmed, '/')) |slash| {
+            if (parseCidr(trimmed[0..slash], trimmed[slash + 1 ..])) |rule| try rules.append(arena, rule);
+            continue;
+        }
+        if (splitHostPort(trimmed)) |host_port| {
+            const host = try lowerDup(arena, stripLeadingDot(host_port.host));
+            if (host.len == 0) continue;
+            if (host_port.port) |port| {
+                try rules.append(arena, .{ .host_port = .{ .host = host, .port = port } });
+            } else {
+                try rules.append(arena, .{ .host = host });
+            }
+            continue;
+        }
+        const host = std.mem.trim(u8, stripLeadingDot(trimmed), " \t\r\n");
+        if (host.len == 0) continue;
+        try rules.append(arena, .{ .host = try lowerDup(arena, host) });
+    }
+    return rules.toOwnedSlice(arena);
+}
+
+const HostPortSpec = struct { host: []const u8, port: ?u16 };
+
+fn splitHostPort(text: []const u8) ?HostPortSpec {
+    if (text.len != 0 and text[0] == '[') {
+        const end = std.mem.findScalar(u8, text, ']') orelse return null;
+        const host = text[1..end];
+        const rest = text[end + 1 ..];
+        if (rest.len == 0) return .{ .host = host, .port = null };
+        if (rest[0] != ':') return null;
+        const port = std.fmt.parseInt(u16, rest[1..], 10) catch return null;
+        return .{ .host = host, .port = port };
+    }
+    const first = std.mem.findScalar(u8, text, ':') orelse return .{ .host = text, .port = null };
+    if (std.mem.findScalarPos(u8, text, first + 1, ':')) |_| return .{ .host = text, .port = null };
+    const port = std.fmt.parseInt(u16, text[first + 1 ..], 10) catch
+        return .{ .host = text, .port = null };
+    return .{ .host = text[0..first], .port = port };
+}
+
+fn parseCidr(address_text: []const u8, bits_text: []const u8) ?Rule {
+    const address = std.Io.net.IpAddress.parse(address_text, 0) catch return null;
+    const bits = std.fmt.parseInt(u8, bits_text, 10) catch return null;
+    return switch (address) {
+        .ip4 => |v4| if (bits <= 32) Rule{ .cidr4 = .{ .addr = v4.bytes, .bits = @intCast(bits) } } else null,
+        .ip6 => |v6| if (bits <= 128) Rule{ .cidr6 = .{ .addr = v6.bytes, .bits = @intCast(bits) } } else null,
+    };
+}
+
+fn lowerDup(arena: std.mem.Allocator, text: []const u8) ConfigError![]const u8 {
+    const buffer = try arena.alloc(u8, text.len);
+    return std.ascii.lowerString(buffer, text);
+}
+
+/// Matches `host`/`port` against parsed bypass rules. Exposed for tests.
+fn ruleMatches(rules: []const Rule, raw_host: []const u8, port: u16) bool {
+    const host = stripBrackets(raw_host);
+    for (rules) |rule| switch (rule) {
+        .all => return true,
+        .host => |pattern| if (hostMatches(host, pattern)) return true,
+        .host_port => |host_port| if (host_port.port == port and hostMatches(host, host_port.host)) return true,
+        .cidr4 => |cidr| if (ipv4InCidr(host, cidr)) return true,
+        .cidr6 => |cidr| if (ipv6InCidr(host, cidr)) return true,
+    };
+    return false;
+}
+
+fn stripLeadingDot(text: []const u8) []const u8 {
+    return if (text.len != 0 and text[0] == '.') text[1..] else text;
+}
+
+fn stripBrackets(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
+}
+
+fn hostMatches(host: []const u8, pattern: []const u8) bool {
+    if (pattern.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(host, pattern)) return true;
+    if (host.len <= pattern.len) return false;
+    if (!std.ascii.endsWithIgnoreCase(host, pattern)) return false;
+    return host[host.len - pattern.len - 1] == '.';
+}
+
+fn ipv4InCidr(host: []const u8, cidr: Rule.Cidr4) bool {
+    const address = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    const bytes = switch (address) {
+        .ip4 => |v4| v4.bytes,
+        else => return false,
+    };
+    return prefixMatches(4, &bytes, &cidr.addr, cidr.bits);
+}
+
+fn ipv6InCidr(host: []const u8, cidr: Rule.Cidr6) bool {
+    const address = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    const bytes = switch (address) {
+        .ip6 => |v6| v6.bytes,
+        else => return false,
+    };
+    return prefixMatches(16, &bytes, &cidr.addr, @intCast(cidr.bits));
+}
+
+fn prefixMatches(comptime len: usize, address: *const [len]u8, network: *const [len]u8, bits: u8) bool {
+    const full_bytes = bits / 8;
+    const remainder: u4 = @intCast(bits % 8);
+    if (!std.mem.eql(u8, address[0..full_bytes], network[0..full_bytes])) return false;
+    if (remainder == 0) return true;
+    const shift: u3 = @intCast(8 - remainder);
+    return (address[full_bytes] >> shift) == (network[full_bytes] >> shift);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn testEnv(entries: []const struct { []const u8, []const u8 }) !std.process.Environ.Map {
+    var map = std.process.Environ.Map.init(testing.allocator);
+    errdefer map.deinit();
+    for (entries) |entry| try map.put(entry[0], entry[1]);
+    return map;
+}
+
+fn rulesOf(arena: std.mem.Allocator, entries: []const []const u8) ![]const Rule {
+    return parseRules(arena, entries);
+}
+
+fn matches(entries: []const []const u8, host: []const u8, port: u16) !bool {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rules = try rulesOf(arena.allocator(), entries);
+    return ruleMatches(rules, host, port);
+}
+
+test "no_proxy matches hosts, suffixes, ports, wildcards, and CIDRs" {
+    const cases = [_]struct { []const []const u8, []const u8, u16, bool }{
+        .{ &.{"x"}, "x", 443, true },
+        .{ &.{"x"}, "x", 80, true },
+        .{ &.{"x"}, "y", 80, false },
+        .{ &.{".corp"}, "api.corp", 443, true },
+        .{ &.{".corp"}, "corp", 443, true },
+        .{ &.{".corp"}, "notcorp", 443, false },
+        .{ &.{"corp"}, "api.corp", 443, true },
+        .{ &.{"Corp"}, "API.CORP", 443, true },
+        .{ &.{"api.corp"}, "corp", 443, false },
+        .{ &.{"*"}, "anything.example", 1, true },
+        .{ &.{"api.corp:8443"}, "api.corp", 8443, true },
+        .{ &.{"api.corp:8443"}, "api.corp", 443, false },
+        .{ &.{"10.0.0.0/8"}, "10.1.2.3", 443, true },
+        .{ &.{"10.0.0.0/8"}, "11.1.2.3", 443, false },
+        .{ &.{"10.0.0.0/8"}, "api.corp", 443, false },
+        .{ &.{"192.168.1.0/24"}, "192.168.1.255", 443, true },
+        .{ &.{"192.168.1.0/24"}, "192.168.2.1", 443, false },
+        .{ &.{"2001:db8::/32"}, "[2001:db8::1]", 443, true },
+        .{ &.{"2001:db8::/32"}, "[2001:db9::1]", 443, false },
+        .{ &.{"::1"}, "::1", 443, true },
+        .{ &.{"localhost"}, "localhost", 80, true },
+        .{ &.{}, "localhost", 80, false },
+        .{ &.{"bad/entry"}, "bad", 80, false },
+    };
+    for (cases) |case| {
+        try testing.expectEqual(case[3], try matches(case[0], case[1], case[2]));
+    }
+}
+
+test "buildProxy parses scheme, port, and credentials" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const plain = try buildProxy(alloc, "http://user:pass@127.0.0.1:8080", null);
+    try testing.expectEqual(std.http.Client.Protocol.plain, plain.protocol);
+    try testing.expectEqualStrings("127.0.0.1", plain.host.bytes);
+    try testing.expectEqual(@as(u16, 8080), plain.port);
+    try testing.expect(plain.authorization != null);
+    // The basic value is `Basic <base64(user:pass)>`.
+    try testing.expect(std.mem.startsWith(u8, plain.authorization.?, "Basic "));
+
+    const secure = try buildProxy(alloc, "https://proxy.example.com", null);
+    try testing.expectEqual(std.http.Client.Protocol.tls, secure.protocol);
+    try testing.expectEqual(@as(u16, 443), secure.port);
+    try testing.expect(secure.authorization == null);
+
+    const schemeless = try buildProxy(alloc, "proxy.example.com:3128", null);
+    try testing.expectEqual(std.http.Client.Protocol.plain, schemeless.protocol);
+    try testing.expectEqual(@as(u16, 3128), schemeless.port);
+
+    try testing.expectError(error.UnsupportedProxyScheme, buildProxy(alloc, "socks5://proxy.example.com:1080", null));
+}
+
+test "maskedExplicitUrl hides credentials" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    const masked = maskedExplicitUrl().?;
+    try testing.expect(std.mem.find(u8, masked, "secret") == null);
+    try testing.expectEqualStrings("http://[redacted]@127.0.0.1:8080", masked);
+}
+
+test "sourceFor reports where each surface resolves" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "HTTPS_PROXY", "http://env-proxy.example:3128" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    try testing.expectEqual(Source.explicit, sourceFor(.model));
+    try testing.expectEqual(Source.environment, sourceFor(.mcp));
+    try testing.expectEqual(Source.environment, sourceFor(.upgrade));
+    // Children inherit the standard variables unless fx exports an explicit
+    // proxy for them.
+    try testing.expectEqual(Source.environment, sourceFor(.children));
+    try testing.expect(isEnabled(.mcp));
+    try testing.expect(environmentConfigured());
+
+    var buffer: [5]Surface = undefined;
+    try testing.expectEqualSlices(Surface, &.{.model}, explicitSurfaces(&buffer));
+
+    reset();
+    try testing.expectEqual(Source.none, sourceFor(.model));
+    try testing.expect(!environmentConfigured());
+    try testing.expectEqualSlices(Surface, &.{}, explicitSurfaces(&buffer));
+}
+
+test "endpointFor follows the explicit scope, the bypass list, and the target scheme" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model,web" },
+        .{ "HTTP_PROXY", "http://plain-proxy.example:3128" },
+        .{ "HTTPS_PROXY", "http://secure-proxy.example:8443" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    // In scope: the explicit proxy wins, credentials included.
+    const web = endpointFor(.web, true, "example.com", 443).?;
+    try testing.expectEqualStrings("127.0.0.1", web.host);
+    try testing.expectEqual(@as(u16, 8080), web.port);
+    try testing.expect(!web.tls);
+    try testing.expect(web.authorization != null);
+
+    // A bypass entry in scope means a direct connection, never a fallback.
+    try testing.expect(endpointFor(.web, true, "localhost", 443) == null);
+    try testing.expect(endpointFor(.web, false, "127.0.0.1", 80) == null);
+
+    // Out of scope: the standard variables decide, by target scheme.
+    const plain_fallback = endpointFor(.mcp, false, "example.com", 80).?;
+    try testing.expectEqualStrings("plain-proxy.example", plain_fallback.host);
+    try testing.expectEqual(@as(u16, 3128), plain_fallback.port);
+    const tls_fallback = endpointFor(.mcp, true, "example.com", 443).?;
+    try testing.expectEqualStrings("secure-proxy.example", tls_fallback.host);
+    try testing.expectEqual(@as(u16, 8443), tls_fallback.port);
+
+    // Children export variables instead of dialing, so they never select one.
+    try testing.expect(endpointFor(.children, true, "example.com", 443) == null);
+}
+
+test "apply_to names surfaces and the all shortcut" {
+    var named = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "web,upgrade" },
+    });
+    defer named.deinit();
+    try initFromEnvMap(&named, .{});
+    defer reset();
+
+    var buffer: [max_surfaces]Surface = undefined;
+    try testing.expectEqualSlices(Surface, &.{ .upgrade, .web }, explicitSurfaces(&buffer));
+    try testing.expect(endpointFor(.web, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.model, true, "example.com", 443) == null);
+
+    var everything = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "all" },
+    });
+    defer everything.deinit();
+    try initFromEnvMap(&everything, .{});
+
+    try testing.expectEqualSlices(Surface, &all_surfaces, explicitSurfaces(&buffer));
+    try testing.expect(endpointFor(.model, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.mcp, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.upgrade, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.web, true, "example.com", 443) != null);
+    // Children still export variables instead of selecting an endpoint.
+    try testing.expect(endpointFor(.children, true, "example.com", 443) == null);
+}
+
+test "an unknown apply_to name fails resolution instead of narrowing silently" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model,fetch" },
+    });
+    defer map.deinit();
+
+    try testing.expectError(error.InvalidProxyApplyTo, initFromEnvMap(&map, .{}));
+    defer reset();
+}
+
+test "password_env supplies the proxy password for children without touching the stored url" {
+    var map = try testEnv(&.{.{ "PROXY_PASS", "s3cret" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{ .stored = .{
+        .url = "http://user@proxy.example:8080",
+        .password_env = "PROXY_PASS",
+        .apply_to = &.{ .model, .children },
+    } });
+    defer reset();
+
+    try testing.expectEqualStrings("PROXY_PASS", passwordEnv().?.name);
+    try testing.expect(passwordEnv().?.resolved);
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    try testing.expectEqual(@as(usize, max_child_exports), exports.len);
+    try testing.expectEqualStrings("http://user:s3cret@proxy.example:8080", exports[0].value);
+
+    // The secret never reaches a display path, and the user is masked with it.
+    try testing.expect(std.mem.find(u8, maskedExplicitUrl().?, "s3cret") == null);
+    try testing.expectEqualStrings("http://[redacted]@proxy.example:8080", maskedExplicitUrl().?);
+}
+
+test "a password variable with special characters stays one url" {
+    var map = try testEnv(&.{.{ "PROXY_PASS", "p@ss:word" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{ .stored = .{
+        .url = "http://user@[2001:db8::1]:3128",
+        .password_env = "PROXY_PASS",
+        .apply_to = &.{.children},
+    } });
+    defer reset();
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    try testing.expect(exports.len > 0);
+
+    const parsed = try std.Uri.parse(exports[0].value);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try parsed.password.?.toRawMaybeAlloc(arena.allocator());
+    try testing.expectEqualStrings("p@ss:word", decoded);
+    try testing.expectEqualStrings("user", try parsed.user.?.toRawMaybeAlloc(arena.allocator()));
+    try testing.expectEqualStrings("[2001:db8::1]", try parsed.host.?.toRawMaybeAlloc(arena.allocator()));
+    try testing.expectEqual(@as(?u16, 3128), parsed.port);
+}
+
+test "an unset or empty password variable keeps the url password" {
+    var map = try testEnv(&.{.{ "PROXY_PASS", "" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{ .stored = .{
+        .url = "http://user:urlpass@proxy.example:8080",
+        .password_env = "PROXY_PASS",
+        .apply_to = &.{.children},
+    } });
+    defer reset();
+
+    try testing.expectEqualStrings("PROXY_PASS", passwordEnv().?.name);
+    try testing.expect(!passwordEnv().?.resolved);
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    try testing.expectEqualStrings("http://user:urlpass@proxy.example:8080", exports[0].value);
+}
+
+test "buildProxy prefers a supplied password over the url one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const from_env = try buildProxy(alloc, "http://user:urlpass@127.0.0.1:8080", "envpass");
+    try testing.expectEqualStrings("Basic dXNlcjplbnZwYXNz", from_env.authorization.?);
+
+    const from_url = try buildProxy(alloc, "http://user:urlpass@127.0.0.1:8080", null);
+    try testing.expectEqualStrings("Basic dXNlcjp1cmxwYXNz", from_url.authorization.?);
+}
+
+test "endpointFor reports a TLS proxy endpoint and nothing without a resolution" {
+    try testing.expect(endpointFor(.web, true, "example.com", 443) == null);
+
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "https://secure-proxy.example:8443" },
+        .{ "FX_PROXY_APPLY_TO", "web" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    const web = endpointFor(.web, true, "example.com", 443).?;
+    try testing.expectEqualStrings("secure-proxy.example", web.host);
+    try testing.expectEqual(@as(u16, 8443), web.port);
+    try testing.expect(web.tls);
+    try testing.expect(web.authorization == null);
+}
+
+test "childExports covers the children surface only" {
+    var model_only = try testEnv(&.{
+        .{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model" },
+        .{ "FX_NO_PROXY", ".corp,10.0.0.0/8" },
+    });
+    defer model_only.deinit();
+
+    try initFromEnvMap(&model_only, .{});
+    defer reset();
+    // Model traffic is proxied, but a shell command keeps the parent
+    // environment unless the user asks for the children surface.
+    var buffer: [max_child_exports]ChildExport = undefined;
+    try testing.expectEqual(@as(usize, 0), childExports(&buffer).len);
+
+    var with_children = try testEnv(&.{
+        .{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model,children" },
+        .{ "FX_NO_PROXY", ".corp,10.0.0.0/8" },
+    });
+    defer with_children.deinit();
+    try initFromEnvMap(&with_children, .{});
+
+    const exports = childExports(&buffer);
+    try testing.expectEqual(@as(usize, max_child_exports), exports.len);
+    for (exports[0..4]) |entry| {
+        try testing.expectEqualStrings("http://user:secret@127.0.0.1:8080", entry.value);
+    }
+    try testing.expectEqualStrings("HTTP_PROXY", exports[0].name);
+    try testing.expectEqualStrings("https_proxy", exports[3].name);
+    try testing.expectEqualStrings("NO_PROXY", exports[4].name);
+    try testing.expectEqualStrings(".corp,10.0.0.0/8", exports[4].value);
+    try testing.expectEqualStrings("no_proxy", exports[5].name);
+}
+
+test "childExports stays empty for environment-only and unreachable state" {
+    var env_only = try testEnv(&.{
+        .{ "HTTPS_PROXY", "http://env-proxy.example:3128" },
+        .{ "NO_PROXY", "inherited.example" },
+    });
+    defer env_only.deinit();
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    try initFromEnvMap(&env_only, .{});
+    defer reset();
+    // Child processes already inherit the standard variables, so fx adds
+    // nothing and leaves the inherited bypass list alone.
+    try testing.expectEqual(@as(usize, 0), childExports(&buffer).len);
+
+    try initFromEnvMap(&env_only, .{ .stored = .{
+        .url = "http://127.0.0.1:3128",
+        .no_proxy = &.{},
+        .apply_to = &.{.children},
+    } });
+    const exports = childExports(&buffer);
+    // An empty value is deliberate: it stops the child from bypassing a proxy
+    // the user selected.
+    try testing.expectEqualStrings("", exports[4].value);
+    try testing.expectEqualStrings("", exports[5].value);
+}
+
+test "explicit FX_PROXY applies to model and leaves other surfaces to the environment" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "HTTPS_PROXY", "http://env-proxy.example:3128" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var model = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/v4/ai/language-model");
+    defer model.deinit();
+    try testing.expect(model.https_proxy != null);
+    try testing.expectEqualStrings("127.0.0.1", model.https_proxy.?.host.bytes);
+    try testing.expectEqual(@as(u16, 8080), model.https_proxy.?.port);
+
+    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer mcp.deinit();
+    try testing.expect(mcp.https_proxy != null);
+    try testing.expectEqualStrings("env-proxy.example", mcp.https_proxy.?.host.bytes);
+}
+
+test "default no_proxy keeps loopback providers direct" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var local = initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/chat/completions");
+    defer local.deinit();
+    try testing.expect(local.http_proxy == null);
+    try testing.expect(local.https_proxy == null);
+
+    var named = initClient(testing.allocator, .model, "http://localhost:11434/v1/models");
+    defer named.deinit();
+    try testing.expect(named.http_proxy == null);
+}
+
+test "an explicit empty bypass list routes loopback through the proxy" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_NO_PROXY", "" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var local = initClient(testing.allocator, .model, "http://127.0.0.1:11434/v1/models");
+    defer local.deinit();
+    try testing.expect(local.http_proxy != null);
+    try testing.expectEqualStrings("127.0.0.1", local.http_proxy.?.host.bytes);
+}
+
+test "FX_PROXY_APPLY_TO scopes the explicit proxy" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "mcp,upgrade" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var model = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
+    defer model.deinit();
+    try testing.expect(model.https_proxy == null);
+
+    var upgrade = initClient(testing.allocator, .upgrade, "https://api.github.com/repos/vercel-labs/fx/releases");
+    defer upgrade.deinit();
+    try testing.expect(upgrade.https_proxy != null);
+}
+
+test "standard environment alone is honored on every surface" {
+    var map = try testEnv(&.{.{ "HTTPS_PROXY", "http://env-proxy.example:3128" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer mcp.deinit();
+    try testing.expect(mcp.https_proxy != null);
+
+    var upgrade = initClient(testing.allocator, .upgrade, "https://api.github.com/repos/vercel-labs/fx/releases");
+    defer upgrade.deinit();
+    try testing.expect(upgrade.https_proxy != null);
+}
+
+test "source priority: flags override FX_PROXY, which overrides stored settings" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
+    defer map.deinit();
+
+    const stored: Config = .{ .url = "http://127.0.0.1:9999" };
+    try initFromEnvMap(&map, .{
+        .override_url = "http://127.0.0.1:1111",
+        .stored = stored,
+    });
+    defer reset();
+
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 1111), client.https_proxy.?.port);
+}
+
+test "stored settings apply when neither flags nor FX_PROXY are present" {
+    var map = try testEnv(&.{});
+    defer map.deinit();
+
+    const stored: Config = .{ .url = "http://127.0.0.1:9999" };
+    try initFromEnvMap(&map, .{ .stored = stored });
+    defer reset();
+
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 9999), client.https_proxy.?.port);
+
+    // A surface outside `apply_to` still has no explicit setting.
+    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer mcp.deinit();
+    try testing.expect(mcp.https_proxy == null);
+}
+
+test "flag overrides refine the selected explicit configuration" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "http://127.0.0.1:8080" }});
+    defer map.deinit();
+
+    try setFlagOverrides("http://127.0.0.1:2222", &.{"api.corp"}, &.{.model});
+    defer reset();
+
+    try initFromEnvMap(&map, .{});
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 2222), client.https_proxy.?.port);
+
+    var bypassed = initClient(testing.allocator, .model, "https://api.corp/v1/models");
+    defer bypassed.deinit();
+    try testing.expect(bypassed.https_proxy == null);
+
+    // The scope is the flag's, so a surface outside it stays on the fallback.
+    var mcp = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer mcp.deinit();
+    try testing.expect(mcp.https_proxy == null);
+}
+
+test "a flag url applies with no other configuration present" {
+    var map = try testEnv(&.{});
+    defer map.deinit();
+
+    try setFlagOverrides("http://127.0.0.1:3333", null, null);
+    defer reset();
+
+    try initFromEnvMap(&map, .{});
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqual(@as(u16, 3333), client.https_proxy.?.port);
+}
+
+test "an explicit url is copied so its parsed host outlives the caller buffer" {
+    var map = try testEnv(&.{});
+    defer map.deinit();
+
+    // A caller-owned buffer that dies right after resolution, like the parsed
+    // settings JSON that the config runtime frees when loading finishes.
+    const caller_buffer = try testing.allocator.dupe(u8, "http://127.0.0.1:8080");
+    try initFromEnvMap(&map, .{ .stored = .{ .url = caller_buffer, .no_proxy = &.{} } });
+    defer reset();
+    testing.allocator.free(caller_buffer);
+
+    var client = initClient(testing.allocator, .model, "https://example.com/");
+    defer client.deinit();
+    try testing.expectEqualStrings("127.0.0.1", client.https_proxy.?.host.bytes);
+    try testing.expectEqual(@as(u16, 8080), client.https_proxy.?.port);
+}
+
+test "StoredConfig owns and frees its lists" {
+    const alloc = testing.allocator;
+    const entries = try alloc.alloc([]const u8, 2);
+    entries[0] = try alloc.dupe(u8, "localhost");
+    entries[1] = try alloc.dupe(u8, ".corp");
+    const surfaces = try alloc.alloc(Surface, 1);
+    surfaces[0] = .mcp;
+    var stored: StoredConfig = .{
+        .url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .no_proxy = entries,
+        .apply_to = surfaces,
+    };
+    const view = stored.config();
+    try testing.expectEqualStrings("http://127.0.0.1:8080", view.url);
+    try testing.expectEqualStrings(".corp", view.no_proxy[1]);
+    try testing.expectEqual(Surface.mcp, view.apply_to[0]);
+    stored.deinit(alloc);
+}
+
+test "an unrepresentable standard proxy variable is skipped instead of failing startup" {
+    var map = try testEnv(&.{.{ "ALL_PROXY", "socks5://127.0.0.1:1080" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var client = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
+    defer client.deinit();
+    try testing.expect(client.http_proxy == null);
+    try testing.expect(client.https_proxy == null);
+    try testing.expect(!isEnabled(.model));
+}
+
+test "NO_PROXY from the environment bypasses the environment proxy" {
+    var map = try testEnv(&.{
+        .{ "HTTPS_PROXY", "http://env-proxy.example:3128" },
+        .{ "NO_PROXY", ".internal,10.0.0.0/8" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var bypassed = initClient(testing.allocator, .mcp, "https://mcp.internal/sse");
+    defer bypassed.deinit();
+    try testing.expect(bypassed.https_proxy == null);
+
+    var proxied = initClient(testing.allocator, .mcp, "https://mcp.example.com/sse");
+    defer proxied.deinit();
+    try testing.expect(proxied.https_proxy != null);
+}
+
+test "an invalid explicit proxy is an error rather than a silent direct connection" {
+    var map = try testEnv(&.{.{ "FX_PROXY", "socks5://127.0.0.1:1080" }});
+    defer map.deinit();
+
+    try testing.expectError(error.UnsupportedProxyScheme, initFromEnvMap(&map, .{}));
+    defer reset();
+
+    // Nothing was installed, so the process does not pretend to be proxied.
+    try testing.expect(!isEnabled(.model));
+}
+
+test "absent configuration leaves every client direct" {
+    var map = try testEnv(&.{});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    var client = initClient(testing.allocator, .model, "https://ai-gateway.vercel.sh/");
+    defer client.deinit();
+    try testing.expect(client.http_proxy == null);
+    try testing.expect(client.https_proxy == null);
+    try testing.expect(!isEnabled(.model));
+}

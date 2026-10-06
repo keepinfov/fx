@@ -6,6 +6,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
@@ -332,10 +333,7 @@ const GenerationLookupOperation = struct {
         defer self.alloc.free(url);
         const uri = try std.Uri.parse(url);
 
-        var client: std.http.Client = .{
-            .allocator = self.alloc,
-            .io = io_mod.getIo(),
-        };
+        var client = proxy_mod.initClient(self.alloc, .model, url);
         defer client.deinit();
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);
@@ -383,10 +381,10 @@ fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team:
 }
 
 fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, default_url: []const u8, e2e_url_env: []const u8) !GetResult {
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-
     const url = try resolveE2eGatewayUrl(e2e_url_env, default_url);
+
+    var client = proxy_mod.initClient(alloc, .model, url);
+    defer client.deinit();
 
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
@@ -536,7 +534,7 @@ fn fetchGatewayJsonAtUrlCore(
 ) !GatewayJsonResult {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .model, url);
     defer client.deinit();
 
     const uri = try std.Uri.parse(url);
@@ -651,7 +649,7 @@ pub fn postGatewayCompletion(
     var attempt: usize = 0;
     while (attempt < retry_count) : (attempt += 1) {
         debug_trace.logf("stream", "open attempt={d}/{d} url={s} payload_bytes={d}", .{ attempt + 1, retry_count, request_url, payload.len });
-        var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+        var client = proxy_mod.initClient(alloc, .model, request_url);
         defer client.deinit();
 
         const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{api_key});
@@ -1533,7 +1531,7 @@ fn streamGatewayCompletionCoreWithOptions(
         const client: *std.http.Client = if (request.shared_pool) |pool|
             pool.clientFor(request_url)
         else blk: {
-            local_client = .{ .allocator = alloc, .io = io_mod.getIo() };
+            local_client = proxy_mod.initClient(alloc, .model, request_url);
             break :blk &local_client;
         };
         defer if (request.shared_pool == null) local_client.deinit();

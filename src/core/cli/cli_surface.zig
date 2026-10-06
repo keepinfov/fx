@@ -15,6 +15,7 @@ const configured_provider = @import("../config/configured_provider.zig");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
 const provider_management = @import("../config/provider_management.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const provider_secret_store = @import("../auth/provider_secret_store.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
@@ -136,6 +137,13 @@ pub const LaunchModifiers = struct {
     fast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
+    /// Per-launch proxy URL (`--proxy`). Owned; null leaves `FX_PROXY` and the
+    /// profile block in charge.
+    proxy_url: ?[]u8 = null,
+    /// `--no-proxy` entries replacing the configured bypass list. Owned.
+    proxy_no_proxy: ?[][]const u8 = null,
+    /// `--proxy-apply-to` surfaces replacing the configured scope. Owned.
+    proxy_apply_to: ?[]proxy_mod.Surface = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -143,6 +151,9 @@ pub const LaunchModifiers = struct {
         if (self.additional_directories.len > 0) alloc.free(self.additional_directories);
         if (self.model_override) |model| alloc.free(model);
         if (self.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
+        if (self.proxy_url) |url| alloc.free(url);
+        freeNoProxyOverride(alloc, self.proxy_no_proxy);
+        if (self.proxy_apply_to) |surfaces| if (surfaces.len > 0) alloc.free(surfaces);
         self.* = .{};
     }
 
@@ -160,6 +171,72 @@ pub const LaunchModifiers = struct {
 fn freeProviderOrderOverride(alloc: Allocator, order: []const []const u8) void {
     for (order) |slug| alloc.free(@constCast(slug));
     if (order.len > 0) alloc.free(order);
+}
+
+fn freeNoProxyOverride(alloc: Allocator, entries: ?[][]const u8) void {
+    const list = entries orelse return;
+    for (list) |entry| alloc.free(@constCast(entry));
+    if (list.len > 0) alloc.free(list);
+}
+
+/// Parses one `--proxy` value, replacing any earlier occurrence. The returned
+/// slice is owned by `alloc`. A configured but unusable proxy fails the launch
+/// instead of silently connecting directly.
+fn setProxyUrlOverride(alloc: Allocator, raw: []const u8, previous: ?[]u8) !?[]u8 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return error.MissingProxyValue;
+    proxy_mod.validateUrl(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProxyValue,
+    };
+    const owned = try alloc.dupe(u8, value);
+    if (previous) |old| alloc.free(old);
+    return owned;
+}
+
+/// Parses one comma-separated `--no-proxy` value. An empty value clears the
+/// bypass list, which routes even loopback traffic through the proxy.
+fn parseNoProxyOverride(alloc: Allocator, raw: []const u8, previous: ?[][]const u8) !?[][]const u8 {
+    var entries: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (entries.items) |entry| alloc.free(@constCast(entry));
+        entries.deinit(alloc);
+    }
+    var iterator = std.mem.splitScalar(u8, raw, ',');
+    while (iterator.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try entries.append(alloc, try alloc.dupe(u8, trimmed));
+    }
+    const owned = try entries.toOwnedSlice(alloc);
+    freeNoProxyOverride(alloc, previous);
+    return owned;
+}
+
+/// Parses one comma-separated `--proxy-apply-to` value, deduplicating repeated
+/// surfaces and rejecting unknown names.
+fn parseProxyApplyToOverride(
+    alloc: Allocator,
+    raw: []const u8,
+    previous: ?[]proxy_mod.Surface,
+) !?[]proxy_mod.Surface {
+    var surfaces: std.ArrayList(proxy_mod.Surface) = .empty;
+    errdefer surfaces.deinit(alloc);
+    var iterator = std.mem.splitScalar(u8, raw, ',');
+    while (iterator.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const expanded = proxy_mod.surfacesForName(trimmed) orelse
+            return error.InvalidProxyApplyToValue;
+        for (expanded) |surface| {
+            if (std.mem.findScalar(proxy_mod.Surface, surfaces.items, surface) != null) continue;
+            try surfaces.append(alloc, surface);
+        }
+    }
+    if (surfaces.items.len == 0) return error.MissingProxyApplyToValue;
+    const owned = try surfaces.toOwnedSlice(alloc);
+    if (previous) |old| if (old.len > 0) alloc.free(old);
+    return owned;
 }
 
 /// Parses one `--provider-order` value, replacing any earlier occurrence.
@@ -404,6 +481,12 @@ fn parseGlobalLaunchArgs(
     var provider_order_override: ?[][]const u8 = null;
     errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
     var provider_strict_override: ?bool = null;
+    var proxy_url: ?[]u8 = null;
+    errdefer if (proxy_url) |url| alloc.free(url);
+    var proxy_no_proxy: ?[][]const u8 = null;
+    errdefer freeNoProxyOverride(alloc, proxy_no_proxy);
+    var proxy_apply_to: ?[]proxy_mod.Surface = null;
+    errdefer if (proxy_apply_to) |surfaces| if (surfaces.len > 0) alloc.free(surfaces);
 
     var index: usize = 0;
     while (index < args.len) {
@@ -466,6 +549,24 @@ fn parseGlobalLaunchArgs(
             provider_order_override = try parseProviderOrderFlag(alloc, args[index], provider_order_override);
         } else if (std.mem.startsWith(u8, arg, "--provider-order=")) {
             provider_order_override = try parseProviderOrderFlag(alloc, arg["--provider-order=".len..], provider_order_override);
+        } else if (std.mem.eql(u8, arg, "--proxy")) {
+            index += 1;
+            if (index >= args.len) return error.MissingProxyValue;
+            proxy_url = try setProxyUrlOverride(alloc, args[index], proxy_url);
+        } else if (std.mem.startsWith(u8, arg, "--proxy=")) {
+            proxy_url = try setProxyUrlOverride(alloc, arg["--proxy=".len..], proxy_url);
+        } else if (std.mem.eql(u8, arg, "--no-proxy")) {
+            index += 1;
+            if (index >= args.len) return error.MissingNoProxyValue;
+            proxy_no_proxy = try parseNoProxyOverride(alloc, args[index], proxy_no_proxy);
+        } else if (std.mem.startsWith(u8, arg, "--no-proxy=")) {
+            proxy_no_proxy = try parseNoProxyOverride(alloc, arg["--no-proxy=".len..], proxy_no_proxy);
+        } else if (std.mem.eql(u8, arg, "--proxy-apply-to")) {
+            index += 1;
+            if (index >= args.len) return error.MissingProxyApplyToValue;
+            proxy_apply_to = try parseProxyApplyToOverride(alloc, args[index], proxy_apply_to);
+        } else if (std.mem.startsWith(u8, arg, "--proxy-apply-to=")) {
+            proxy_apply_to = try parseProxyApplyToOverride(alloc, arg["--proxy-apply-to=".len..], proxy_apply_to);
         } else if (std.mem.eql(u8, arg, "--provider-strict") or std.mem.eql(u8, arg, "--no-provider-strict")) {
             const strict = std.mem.eql(u8, arg, "--provider-strict");
             if (provider_strict_override != null and provider_strict_override.? != strict)
@@ -480,6 +581,14 @@ fn parseGlobalLaunchArgs(
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
     const directory_slice = try directories.toOwnedSlice(alloc);
+    // Register the flag layer before any command can resolve the proxy policy;
+    // this module owns its copies for the process lifetime.
+    if (proxy_url != null or proxy_no_proxy != null or proxy_apply_to != null) {
+        proxy_mod.setFlagOverrides(proxy_url, proxy_no_proxy, proxy_apply_to) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidProxyValue,
+        };
+    }
     return .{
         .remaining = args[index..],
         .modifiers = .{
@@ -492,6 +601,9 @@ fn parseGlobalLaunchArgs(
             .fast_override = fast_override,
             .provider_order_override = provider_order_override,
             .provider_strict_override = provider_strict_override,
+            .proxy_url = proxy_url,
+            .proxy_no_proxy = proxy_no_proxy,
+            .proxy_apply_to = proxy_apply_to,
         },
     };
 }
@@ -513,7 +625,10 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--provider-order") or
             std.mem.eql(u8, arg, "--model") or
-            std.mem.eql(u8, arg, "--effort"))
+            std.mem.eql(u8, arg, "--effort") or
+            std.mem.eql(u8, arg, "--proxy") or
+            std.mem.eql(u8, arg, "--no-proxy") or
+            std.mem.eql(u8, arg, "--proxy-apply-to"))
         {
             index += 1;
             if (index >= args.len) return &.{};
@@ -523,6 +638,9 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.startsWith(u8, arg, "--provider-order=") and
             !std.mem.startsWith(u8, arg, "--model=") and
             !std.mem.startsWith(u8, arg, "--effort=") and
+            !std.mem.startsWith(u8, arg, "--proxy=") and
+            !std.mem.startsWith(u8, arg, "--no-proxy=") and
+            !std.mem.startsWith(u8, arg, "--proxy-apply-to=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs") and
             !std.mem.eql(u8, arg, "--fast") and
             !std.mem.eql(u8, arg, "--no-fast") and
@@ -2685,6 +2803,7 @@ fn statusSnapshotFromStartupWithBuild(
         .session_permission_grants = 0,
         .agent_step_limit = startup.agent_step_limit,
         .login_shell = startup.login_shell,
+        .proxy = output_contracts.ProxySnapshot.fromPolicy(),
         .login_shell_source = switch (startup.login_shell_source) {
             .process_override => "env",
             .user_global => "settings",
@@ -4531,6 +4650,77 @@ test "global model overrides fail closed when malformed" {
     );
 }
 
+test "proxy flags parse into modifiers and skip command detection" {
+    const alloc = std.testing.allocator;
+    defer proxy_mod.setFlagOverrides(null, null, null) catch {};
+
+    var parsed = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--proxy"),
+        @constCast("http://127.0.0.1:8080"),
+        @constCast("--no-proxy"),
+        @constCast("localhost,.corp"),
+        @constCast("--proxy-apply-to"),
+        @constCast("model,mcp"),
+        @constCast("ask"),
+    });
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", parsed.modifiers.proxy_url.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.modifiers.proxy_no_proxy.?.len);
+    try std.testing.expectEqualStrings(".corp", parsed.modifiers.proxy_no_proxy.?[1]);
+    try std.testing.expectEqualSlices(
+        proxy_mod.Surface,
+        &.{ .model, .mcp },
+        parsed.modifiers.proxy_apply_to.?,
+    );
+    try std.testing.expectEqualStrings("ask", parsed.remaining[0]);
+
+    try std.testing.expectError(
+        error.InvalidProxyValue,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--proxy=socks5://127.0.0.1:1080")}),
+    );
+    var web_scope = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--proxy=http://127.0.0.1:8080"),
+        @constCast("--proxy-apply-to=model,web"),
+    });
+    defer web_scope.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        proxy_mod.Surface,
+        &.{ .model, .web },
+        web_scope.modifiers.proxy_apply_to.?,
+    );
+
+    var all_scope = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--proxy=http://127.0.0.1:8080"),
+        @constCast("--proxy-apply-to=all"),
+    });
+    defer all_scope.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        proxy_mod.Surface,
+        &proxy_mod.all_surfaces,
+        all_scope.modifiers.proxy_apply_to.?,
+    );
+
+    try std.testing.expectError(
+        error.InvalidProxyApplyToValue,
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--proxy-apply-to=fetch")}),
+    );
+
+    const remaining = argsAfterGlobalLaunchArgs(&.{
+        @constCast("--proxy=http://127.0.0.1:8080"),
+        @constCast("--no-proxy=localhost"),
+        @constCast("ask"),
+        @constCast("hello"),
+    });
+    try std.testing.expectEqualStrings("ask", remaining[0]);
+
+    const spaced = argsAfterGlobalLaunchArgs(&.{
+        @constCast("--proxy"),
+        @constCast("http://127.0.0.1:8080"),
+        @constCast("ask"),
+    });
+    try std.testing.expectEqualStrings("ask", spaced[0]);
+}
+
 test "argsAfterGlobalLaunchArgs skips provider routing flags" {
     const remaining = argsAfterGlobalLaunchArgs(&.{
         @constCast("--provider-order"),
@@ -5963,6 +6153,8 @@ test "runIfRequested credits failures use nonzero text and json contracts" {
 }
 
 test "runIfRequested local json success appends exactly one newline" {
+    proxy_mod.resetForTests();
+    defer proxy_mod.resetForTests();
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
@@ -5972,7 +6164,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"proxy\":{\"value\":\"off\",\"url\":null,\"origin\":null,\"surfaces\":{\"model\":\"off\",\"mcp\":\"off\",\"upgrade\":\"off\",\"children\":\"off\",\"web\":\"off\"}},\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -6042,6 +6234,8 @@ test "status and doctor inspect MCP configuration once per command" {
 }
 
 test "writeRenderedJsonLine falls back to heap and appends exactly one newline" {
+    proxy_mod.resetForTests();
+    defer proxy_mod.resetForTests();
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
@@ -6061,7 +6255,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"proxy\":{\"value\":\"off\",\"url\":null,\"origin\":null,\"surfaces\":{\"model\":\"off\",\"mcp\":\"off\",\"upgrade\":\"off\",\"children\":\"off\",\"web\":\"off\"}},\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }

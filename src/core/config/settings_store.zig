@@ -7,6 +7,7 @@ const types = @import("../shared/types.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const context_limits = @import("context_limits.zig");
 const project_config = @import("../mcp/project_config.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const configured_provider = @import("configured_provider.zig");
 const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -121,6 +122,12 @@ pub const UserSettingsPatch = struct {
     /// Removes the key entirely so resolution returns to the passwd login
     /// shell. Distinct from a null `login_shell`.
     clear_login_shell: bool = false,
+    /// Replaces the URL of the stored `proxy` block and keeps the rest of it.
+    /// Distinct from a null `proxy_url`, which means "leave unchanged".
+    proxy_url: ?[]const u8 = null,
+    /// Removes the whole `proxy` block so resolution returns to the
+    /// environment. Distinct from a null `proxy_url`.
+    clear_proxy: bool = false,
     prompt_history_enabled: ?bool = null,
     statusline_item: ?StatuslineItemPatch = null,
     session_titles: ?bool = null,
@@ -143,6 +150,8 @@ pub const UserSettingsPatch = struct {
             self.startup_scrollback == null and
             self.login_shell == null and
             !self.clear_login_shell and
+            self.proxy_url == null and
+            !self.clear_proxy and
             self.prompt_history_enabled == null and
             self.statusline_item == null and
             self.session_titles == null and
@@ -1018,6 +1027,90 @@ test "login shell user patch writes an absolute path and clears it" {
     try std.testing.expect(!application.changed);
 }
 
+test "proxy user patch replaces the url and keeps the rest of the block" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"proxy\":{\"url\":\"http://old:3128\",\"no_proxy\":[\".corp\"],\"apply_to\":[\"model\",\"mcp\"],\"password_env\":\"PROXY_PASS\"}}",
+        .{},
+    );
+    var application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .proxy_url = "http://new:8080" },
+    );
+    try std.testing.expect(application.changed);
+    const block = root.object.get("proxy").?.object;
+    try std.testing.expectEqualStrings("http://new:8080", block.get("url").?.string);
+    try std.testing.expectEqualStrings(".corp", block.get("no_proxy").?.array.items[0].string);
+    try std.testing.expectEqualStrings("mcp", block.get("apply_to").?.array.items[1].string);
+    try std.testing.expectEqualStrings("PROXY_PASS", block.get("password_env").?.string);
+
+    application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .proxy_url = "http://new:8080" },
+    );
+    try std.testing.expect(!application.changed);
+
+    application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .clear_proxy = true },
+    );
+    try std.testing.expect(application.changed);
+    try std.testing.expect(!root.object.contains("proxy"));
+
+    application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .clear_proxy = true },
+    );
+    try std.testing.expect(!application.changed);
+}
+
+test "proxy user patch rejects a url the next launch cannot parse" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{});
+    try std.testing.expectError(
+        error.UnsupportedProxyScheme,
+        applyUserPatchToRoot(
+            arena.allocator(),
+            &root,
+            .{ .proxy_url = "socks5://127.0.0.1:1080" },
+        ),
+    );
+    try std.testing.expect(!root.object.contains("proxy"));
+}
+
+test "proxy user patch creates the block when the profile has none" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"model\":\"m\"}",
+        .{},
+    );
+    const application = try applyUserPatchToRoot(
+        arena.allocator(),
+        &root,
+        .{ .proxy_url = "http://127.0.0.1:8080" },
+    );
+    try std.testing.expect(application.changed);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080", root.object.get("proxy").?.object.get("url").?.string);
+    try std.testing.expect(root.object.contains("model"));
+}
+
 test "login shell settings validation requires an absolute path" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1261,6 +1354,16 @@ fn applyUserPatchToRoot(
     if (patch.login_shell) |value| application.changed = try putString(arena, &root.object, "login_shell", value) or application.changed;
     if (patch.clear_login_shell and root.object.contains("login_shell")) {
         _ = root.object.orderedRemove("login_shell");
+        application.changed = true;
+    }
+    if (patch.proxy_url) |value| {
+        // The stored URL must be usable by the next launch, which fails closed
+        // on a proxy it cannot parse.
+        try proxy_mod.validateUrl(arena, value);
+        application.changed = try putProxyUrl(arena, &root.object, value) or application.changed;
+    }
+    if (patch.clear_proxy and root.object.contains("proxy")) {
+        _ = root.object.orderedRemove("proxy");
         application.changed = true;
     }
     if (patch.session_titles) |value| application.changed = try putBool(arena, &root.object, "session_titles", value) or application.changed;
@@ -1783,6 +1886,20 @@ fn putString(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, val
     }
     try object.put(arena, key, .{ .string = try arena.dupe(u8, value) });
     return true;
+}
+
+/// Writes `proxy.url` and preserves the rest of the block: `no_proxy`,
+/// `apply_to`, and any key fx does not own are edited in `settings.json` by
+/// hand, so a URL change must not drop them.
+fn putProxyUrl(arena: Allocator, object: *std.json.ObjectMap, url: []const u8) !bool {
+    var block = if (object.getPtr("proxy")) |value| blk: {
+        if (value.* != .object) return error.InvalidSettingsFormat;
+        break :blk value;
+    } else blk: {
+        try object.put(arena, "proxy", .{ .object = .empty });
+        break :blk object.getPtr("proxy").?;
+    };
+    return putString(arena, &block.object, "url", url);
 }
 
 fn putStringArray(

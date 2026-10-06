@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const ignored_dirs = @import("ignored_dirs.zig");
 const io_mod = @import("../shared/io.zig");
+const system_tools = @import("../shared/system_tools.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1041,13 +1042,18 @@ test "workspace file provider cancellation terminates an active child" {
     const stop_thread = try std.Thread.spawn(.{}, RequestStop.run, .{&stop_requested});
     defer stop_thread.join();
 
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const sleep_argv = [_][]const u8{ sleep_path, "60" };
+
     const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     try std.testing.expectError(
         error.Canceled,
         runCancellable(
             std.testing.allocator,
             .{
-                .argv = &.{ "/bin/sleep", "60" },
+                .argv = &sleep_argv,
                 .stdout_limit = .limited(1024),
                 .stderr_limit = .limited(1024),
             },

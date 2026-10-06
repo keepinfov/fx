@@ -1,6 +1,7 @@
 const std = @import("std");
 const versions = @import("../core/gateway/provider_versions.zig");
 const io_mod = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const gateway_client = @import("client.zig");
 
@@ -85,7 +86,7 @@ const LookupOperation = struct {
     url: []const u8,
 
     pub fn run(self: *LookupOperation) !Response {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
+        var client = proxy_mod.initClient(self.alloc, .model, self.url);
         defer client.deinit();
         const buffer = try self.alloc.alloc(u8, max_response_bytes + 1);
         defer self.alloc.free(buffer);

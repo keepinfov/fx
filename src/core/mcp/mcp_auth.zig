@@ -3,6 +3,7 @@ const host_target = @import("../hosts/target.zig");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const operation_control = @import("operation_control.zig");
 const browser_callback = @import("../auth/browser_callback.zig");
@@ -2210,7 +2211,7 @@ fn request(
     {
         return error.InsecureMcpAuthEndpoint;
     }
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .mcp, url);
     defer client.deinit();
     var http_request = try client.request(method, uri, .{
         .redirect_behavior = .unhandled,

@@ -15,6 +15,7 @@ const legacy_streamable_http = @import("legacy_streamable_http.zig");
 const operation_control = @import("operation_control.zig");
 const controlled_lock = @import("controlled_lock.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const protocol_messages = @import("protocol_messages.zig");
 const buildDiscoverRequest = protocol_messages.buildDiscoverRequest;
 const buildToolsListRequest = protocol_messages.buildToolsListRequest;
@@ -108,15 +109,21 @@ pub fn connectServer(
         existing.deinit();
         server.env_map = null;
     }
+    var proxy_environment: ?std.process.Environ.Map = null;
     defer {
+        if (proxy_environment) |*environment| environment.deinit();
         if (server.env_map) |*environment| environment.deinit();
         server.env_map = null;
     }
     const has_child_environment = for (server.config.env) |entry| {
         if (!std.mem.eql(u8, entry.key, protocol_negotiation.protocol_version_environment)) break true;
     } else false;
-    if (has_child_environment) {
-        server.env_map = try io_mod.cloneEnvironMap(alloc);
+    // The proxy overlay is itself a parent-environment clone, so it also
+    // carries the configured stdio server variables when they are set.
+    proxy_environment = try proxy_mod.childEnvironment(alloc);
+    if (has_child_environment or proxy_environment != null) {
+        server.env_map = proxy_environment orelse try io_mod.cloneEnvironMap(alloc);
+        proxy_environment = null;
         for (server.config.env) |entry| {
             if (std.mem.eql(u8, entry.key, protocol_negotiation.protocol_version_environment)) continue;
             try server.env_map.?.put(entry.key, entry.value);

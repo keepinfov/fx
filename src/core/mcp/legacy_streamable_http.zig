@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const legacy_sse = @import("legacy_sse.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
@@ -558,7 +559,7 @@ fn notificationGetOnceCore(
     try appendHeaders(alloc, &headers, options, false);
 
     const uri = std.Uri.parse(options.url) catch return error.InvalidEndpoint;
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .mcp, options.url);
     defer client.deinit();
     var request = try client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
@@ -678,7 +679,7 @@ fn postCore(alloc: Allocator, options: OperationOptions) !OperationResponse {
     try appendHeaders(alloc, &headers, options, true);
 
     const uri = std.Uri.parse(options.url) catch return error.InvalidEndpoint;
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .mcp, options.url);
     defer client.deinit();
     var request = try client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
@@ -796,7 +797,7 @@ fn resumeOnceCore(
     try appendHeaders(alloc, &headers, resume_options, false);
 
     const uri = std.Uri.parse(options.url) catch return error.InvalidEndpoint;
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .mcp, options.url);
     defer client.deinit();
     var request = try client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
@@ -844,7 +845,7 @@ fn deleteCore(alloc: Allocator, options: OperationOptions) !OperationResponse {
     try appendHeaders(alloc, &headers, options, false);
 
     const uri = std.Uri.parse(options.url) catch return error.InvalidEndpoint;
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var client = proxy_mod.initClient(alloc, .mcp, options.url);
     defer client.deinit();
     var request = try client.request(.DELETE, uri, .{
         .redirect_behavior = .unhandled,

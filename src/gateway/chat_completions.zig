@@ -12,6 +12,7 @@ const classifier = @import("../core/permissions/auto_classifier.zig");
 const gateway_step = @import("../core/agent/runtime/gateway_step.zig");
 const review_messages = @import("vercel_protocol.zig");
 const io = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
@@ -131,7 +132,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer alloc.free(url);
     const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
+    var client = proxy_mod.initClient(alloc, .model, url);
     defer client.deinit();
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;

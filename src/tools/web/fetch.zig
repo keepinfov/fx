@@ -14,6 +14,7 @@ const web_fetch_artifacts = @import("../../core/session/web_fetch_artifacts.zig"
 const content = @import("content.zig");
 const html_to_markdown = @import("html_to_markdown.zig");
 const http_fetch = @import("http_fetch.zig");
+const proxy_mod = @import("../../core/shared/proxy.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -27,7 +28,28 @@ pub const readsOnly = fetch_args.readsOnly;
 pub const isIrreversible = fetch_args.isIrreversible;
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return callWithTransport(ctx, erased, http_fetch.defaultTransport());
+    var transport = http_fetch.defaultTransport();
+    transport.proxy = webFetchSelector();
+    return callWithTransport(ctx, erased, transport);
+}
+
+/// Bridges the process proxy policy to the fetch transport, which dials its own
+/// sockets. The policy is resolved once at startup and read-only afterwards, so
+/// a selector stays valid for the process lifetime.
+var selector_ctx: u8 = 0;
+
+fn selectProxy(_: *anyopaque, host: []const u8, port: u16, target_tls: bool) ?http_fetch.ProxyEndpoint {
+    const endpoint = proxy_mod.endpointFor(.web, target_tls, host, port) orelse return null;
+    return .{
+        .host = endpoint.host,
+        .port = endpoint.port,
+        .tls = endpoint.tls,
+        .authorization = endpoint.authorization,
+    };
+}
+
+fn webFetchSelector() http_fetch.ProxySelector {
+    return .{ .ctx = @ptrCast(&selector_ctx), .select = selectProxy };
 }
 
 fn callWithTransport(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, transport: http_fetch.Transport) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
