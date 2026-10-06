@@ -357,13 +357,16 @@ fn proxyEndpointFor(target: url_policy.ValidatedUrl, selector: ?ProxySelector) ?
 /// configuration, so a loopback or private address is expected and the
 /// public-address policy does not apply to it.
 fn resolveProxyAddresses(alloc: Allocator, endpoint: ProxyEndpoint, options: FetchOptions, resolver: Resolver) ![]IpAddress {
-    if (std.Io.net.IpAddress.parse(endpoint.host, endpoint.port)) |literal| {
+    // A literal host keeps the brackets std parsed it with; neither the address
+    // parser nor the resolver wants them.
+    const host = std.mem.trim(u8, endpoint.host, "[]");
+    if (std.Io.net.IpAddress.parse(host, endpoint.port)) |literal| {
         const out = try alloc.alloc(IpAddress, 1);
         out[0] = literal;
         return out;
     } else |_| {}
 
-    return resolver.resolve(resolver.ctx, alloc, endpoint.host, endpoint.port, normalizedOptions(options));
+    return resolver.resolve(resolver.ctx, alloc, host, endpoint.port, normalizedOptions(options));
 }
 
 fn cloneUrl(alloc: Allocator, source: url_policy.ValidatedUrl) !url_policy.ValidatedUrl {

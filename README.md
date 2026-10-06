@@ -128,6 +128,7 @@ Route outbound traffic through an HTTP proxy by adding a `proxy` block to `~/.fx
 {
   "proxy": {
     "url": "http://user:pass@proxy.example:8080",
+    "password_env": "PROXY_PASS",
     "no_proxy": ["localhost", ".corp", "10.0.0.0/8"],
     "apply_to": ["model"] // model, mcp, upgrade, children, web, or all
   }
@@ -141,6 +142,8 @@ FX_PROXY=http://127.0.0.1:8080 fx
 ```
 
 `apply_to` defaults to `model`, which covers the AI Gateway, custom model connections, model catalogs, version checks, the permission reviewer, and provider sign-in. `mcp` covers HTTP and SSE MCP transports, `upgrade` covers auto-upgrade and `fx upgrade`, `web` covers `web_fetch`, and `children` exports `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` to shell commands, stdio MCP servers, and skill installs. `all` names every surface at once. An unknown name is an error rather than a silently narrower scope, so a typo cannot leave traffic on a direct connection. `children` stays off unless you name it, so child processes keep inheriting your environment.
+
+`password_env` names an environment variable that holds the proxy password, which wins over a password in `url` and keeps the secret out of the profile and out of `ps`. The user still comes from `url`, so `http://user@proxy.example:8080` plus `password_env` works without storing a password at all. A variable that is unset or empty falls back to whatever `url` carries, and `fx doctor` warns when that happens. Child processes still receive a URL with the resolved password, because that is how every proxy-aware tool reads one.
 
 The standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables apply to every surface that has no explicit setting, so a narrow `apply_to` leaves the rest of your environment alone. fx reads the layers in this order: `--proxy` with `--no-proxy` and `--proxy-apply-to`, then `FX_PROXY`, `FX_NO_PROXY`, and `FX_PROXY_APPLY_TO`, then `proxy` under `workspaces["<workspace_path>"]`, then the top-level `proxy` block, then the standard variables. `no_proxy` accepts hosts, `.suffix` entries, `*`, `host:port`, IPv4 and IPv6 addresses, and CIDR blocks, and it replaces the default list of `localhost`, `127.0.0.1`, and `::1`.
 

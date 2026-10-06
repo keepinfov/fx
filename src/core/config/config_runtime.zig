@@ -2056,6 +2056,12 @@ fn parseProxySettings(alloc: Allocator, value: std.json.Value) !proxy_mod.Stored
         }
         parsed.apply_to = try surfaces.toOwnedSlice(alloc);
     }
+    if (value.object.get("password_env")) |password_env_value| {
+        if (password_env_value != .string) return error.InvalidProxyPasswordEnvType;
+        const name = std.mem.trim(u8, password_env_value.string, " \t\r\n");
+        if (name.len == 0) return error.InvalidProxyPasswordEnvValue;
+        parsed.password_env = try alloc.dupe(u8, name);
+    }
     return parsed;
 }
 
@@ -4855,6 +4861,14 @@ test "proxy parses replaces on merge and rejects invalid entries" {
         &proxy_mod.all_surfaces,
         every_surface.proxy.?.apply_to.?,
     );
+
+    var with_password_env = try parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://user@proxy.example:8080\",\"password_env\":\"PROXY_PASS\"}}");
+    defer with_password_env.deinit(alloc);
+    try std.testing.expectEqualStrings("PROXY_PASS", with_password_env.proxy.?.password_env.?);
+    try std.testing.expect(with_password_env.proxy.?.config().password_env != null);
+
+    try std.testing.expectError(error.InvalidProxyPasswordEnvType, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"password_env\":7}}"));
+    try std.testing.expectError(error.InvalidProxyPasswordEnvValue, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"password_env\":\"   \"}}"));
 
     try std.testing.expectError(error.InvalidProxyType, parseSettingsJson(alloc, "{\"proxy\":\"http://127.0.0.1:8080\"}"));
     try std.testing.expectError(error.ProxyUrlRequired, parseSettingsJson(alloc, "{\"proxy\":{\"no_proxy\":[]}}"));

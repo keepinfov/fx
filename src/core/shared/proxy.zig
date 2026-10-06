@@ -73,6 +73,11 @@ pub const Config = struct {
     /// Bypass entries. Empty slice means "nothing bypasses".
     no_proxy: []const []const u8 = default_no_proxy,
     apply_to: []const Surface = default_apply_to,
+    /// Name of an environment variable that holds the proxy password. When it
+    /// resolves, it wins over a password in `url`, which keeps the secret out
+    /// of the profile and out of the process command line. The user still comes
+    /// from `url`.
+    password_env: ?[]const u8 = null,
 };
 
 pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, InvalidProxyApplyTo, OutOfMemory };
@@ -136,6 +141,8 @@ pub const StoredConfig = struct {
     no_proxy: ?[]const []const u8 = null,
     /// Null keeps `default_apply_to`.
     apply_to: ?[]const Surface = null,
+    /// Environment variable that holds the password, or null.
+    password_env: ?[]const u8 = null,
 
     pub fn deinit(self: *StoredConfig, alloc: std.mem.Allocator) void {
         alloc.free(self.url);
@@ -144,6 +151,7 @@ pub const StoredConfig = struct {
             alloc.free(entries);
         }
         if (self.apply_to) |surfaces| alloc.free(surfaces);
+        if (self.password_env) |name| alloc.free(@constCast(name));
         self.* = undefined;
     }
 
@@ -153,6 +161,7 @@ pub const StoredConfig = struct {
             .url = self.url,
             .no_proxy = self.no_proxy orelse default_no_proxy,
             .apply_to = self.apply_to orelse default_apply_to,
+            .password_env = self.password_env,
         };
     }
 };
@@ -178,6 +187,10 @@ const State = struct {
     /// `explicit_url` with credentials masked, built with the resolution so
     /// every surface can display it without allocating.
     masked_explicit_url: ?[]const u8 = null,
+    /// The URL child processes receive. It equals `explicit_url` unless
+    /// `password_env` supplied a password, which is inserted here so a child
+    /// tool can authenticate the way it always has.
+    explicit_child_url: ?[]const u8 = null,
     /// Which layer supplied `explicit_url`.
     explicit_origin: Origin = .settings,
     explicit_proxy: ?*std.http.Client.Proxy = null,
@@ -185,6 +198,10 @@ const State = struct {
     /// Bypass entries joined for `NO_PROXY` in child environments.
     no_proxy_env: ?[]const u8 = null,
     explicit_surfaces: SurfaceSet = SurfaceSet.initEmpty(),
+    /// The password variable the explicit configuration names, and whether it
+    /// supplied a value. Diagnostics and child export only.
+    explicit_password_env: ?[]const u8 = null,
+    explicit_password_resolved: bool = false,
     env_http_proxy: ?*std.http.Client.Proxy = null,
     env_https_proxy: ?*std.http.Client.Proxy = null,
     env_rules: []const Rule = &.{},
@@ -296,7 +313,7 @@ fn resolveAndInstall(env: EnvSource, sources: Sources) ConfigError!void {
         if (override_no_proxy) |entries| config.no_proxy = entries;
         if (override_apply_to) |surfaces| config.apply_to = surfaces;
         state.explicit_origin = origin;
-        try applyExplicit(state, arena, config.*);
+        try applyExplicit(state, arena, config.*, resolvePassword(env, config.password_env));
     }
 
     // The profile value is what `/settings` shows and edits, so refresh its
@@ -330,7 +347,17 @@ fn explicitConfigFromEnv(arena: std.mem.Allocator, env: EnvSource) ConfigError!?
     return .{ .url = url, .no_proxy = no_proxy, .apply_to = apply_to };
 }
 
-fn applyExplicit(state: *State, arena: std.mem.Allocator, config: Config) ConfigError!void {
+/// Reads the named password variable. A missing or empty value means the URL
+/// itself supplies the password, which keeps a stale variable from silently
+/// stripping credentials the user already configured.
+fn resolvePassword(env: EnvSource, name: ?[]const u8) ?[]const u8 {
+    const key = name orelse return null;
+    const value = env.get(key) orelse return null;
+    if (value.len == 0) return null;
+    return value;
+}
+
+fn applyExplicit(state: *State, arena: std.mem.Allocator, config: Config, password: ?[]const u8) ConfigError!void {
     const url = std.mem.trim(u8, config.url, " \t\r\n");
     if (url.len == 0) return;
     // Build the proxy from the arena copy, never from the caller's buffer:
@@ -339,12 +366,20 @@ fn applyExplicit(state: *State, arena: std.mem.Allocator, config: Config) Config
     // as the parsed settings JSON, may free it long before the last request.
     state.explicit_url = try arena.dupe(u8, url);
     state.masked_explicit_url = try text_utils.redactUrlForDisplay(arena, url);
-    state.explicit_proxy = try buildProxy(arena, state.explicit_url.?);
+    state.explicit_proxy = try buildProxy(arena, state.explicit_url.?, password);
     state.explicit_rules = try parseRules(arena, config.no_proxy);
     // Child processes receive the list in its standard comma-separated form,
     // so the export does not depend on how this build parses rules.
     state.no_proxy_env = try std.mem.join(arena, ",", config.no_proxy);
     state.explicit_surfaces = surfaceSet(config.apply_to);
+    state.explicit_password_env = if (config.password_env) |name| try arena.dupe(u8, name) else null;
+    state.explicit_password_resolved = password != null;
+    // Every proxy-aware tool reads a password from the URL, so a child gets the
+    // resolved password even when fx itself keeps it in a variable.
+    state.explicit_child_url = if (password) |secret|
+        try urlWithPassword(arena, state.explicit_url.?, secret)
+    else
+        state.explicit_url.?;
 }
 
 fn applyEnvironment(state: *State, arena: std.mem.Allocator, env: EnvSource) ConfigError!void {
@@ -373,7 +408,7 @@ fn envProxy(
         const value = map.get(name) orelse continue;
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len == 0) continue;
-        return buildProxy(arena, trimmed) catch continue;
+        return buildProxy(arena, trimmed, null) catch continue;
     }
     return null;
 }
@@ -419,6 +454,17 @@ pub fn explicitSurfaces(buffer: []Surface) []const Surface {
 pub fn environmentConfigured() bool {
     const state = global_state orelse return false;
     return state.env_configured;
+}
+
+/// The password variable the explicit configuration names, and whether it
+/// supplied a value. Diagnostics only: `fx doctor` warns about a name that
+/// resolves to nothing, because fx then falls back to a passwordless URL.
+pub const PasswordEnv = struct { name: []const u8, resolved: bool };
+
+pub fn passwordEnv() ?PasswordEnv {
+    const state = global_state orelse return null;
+    const name = state.explicit_password_env orelse return null;
+    return .{ .name = name, .resolved = state.explicit_password_resolved };
 }
 
 /// The explicit proxy URL with credentials masked, or null when no explicit
@@ -584,7 +630,7 @@ pub const max_child_exports = 6;
 /// entries.
 pub fn childExports(buffer: []ChildExport) []const ChildExport {
     const state = global_state orelse return &.{};
-    const url = state.explicit_url orelse return &.{};
+    const url = state.explicit_child_url orelse return &.{};
     if (!state.explicit_surfaces.contains(.children)) return &.{};
 
     var count: usize = 0;
@@ -623,7 +669,7 @@ pub fn childEnvironment(alloc: std.mem.Allocator) io_mod.CloneEnvironMapError!?s
 pub fn validateUrl(alloc: std.mem.Allocator, url: []const u8) ConfigError!void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    _ = try buildProxy(arena.allocator(), url);
+    _ = try buildProxy(arena.allocator(), url, null);
 }
 
 const Target = struct { host: []const u8, port: u16 };
@@ -642,26 +688,66 @@ fn defaultPort(protocol: std.http.Client.Protocol) u16 {
     };
 }
 
-fn buildProxy(arena: std.mem.Allocator, raw_url: []const u8) ConfigError!*std.http.Client.Proxy {
-    // A URL without `://` is an authority with an implicit `http` scheme, so
-    // `127.0.0.1:8080` and `user:pass@host:8080` work. An explicit unknown
-    // scheme is rejected instead of being guessed at.
-    const uri = blk: {
-        if (std.mem.find(u8, raw_url, "://") != null) {
-            break :blk std.Uri.parse(raw_url) catch return error.InvalidProxyUrl;
-        }
-        const with_scheme = try std.fmt.allocPrint(arena, "http://{s}", .{raw_url});
-        break :blk std.Uri.parse(with_scheme) catch return error.InvalidProxyUrl;
+/// A URL without `://` is an authority with an implicit `http` scheme, so
+/// `127.0.0.1:8080` and `user:pass@host:8080` work. An explicit unknown scheme
+/// is rejected instead of being guessed at.
+fn parseProxyUri(arena: std.mem.Allocator, raw_url: []const u8) ConfigError!std.Uri {
+    if (std.mem.find(u8, raw_url, "://") != null) {
+        return std.Uri.parse(raw_url) catch error.InvalidProxyUrl;
+    }
+    const with_scheme = try std.fmt.allocPrint(arena, "http://{s}", .{raw_url});
+    return std.Uri.parse(with_scheme) catch error.InvalidProxyUrl;
+}
+
+/// `raw_url` with `password` as its password, percent-encoded so the result is
+/// still one URL. This is what child processes receive: every proxy-aware tool
+/// reads a password from the URL, and the child environment is not a file or a
+/// command line the user has to keep the secret out of.
+fn urlWithPassword(arena: std.mem.Allocator, raw_url: []const u8, password: []const u8) ConfigError![]const u8 {
+    const uri = try parseProxyUri(arena, raw_url);
+    const scheme = uri.scheme;
+    const host = uri.getHostAlloc(arena) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidProxyUrl,
     };
+    const host_name = host.bytes;
+    if (host_name.len == 0) return error.InvalidProxyUrl;
+    // getHostAlloc keeps the brackets of a literal host, so only a bare
+    // colon-separated host still needs them.
+    const bracketed = host_name.len > 0 and host_name[0] == '[';
+    const ipv6 = !bracketed and std.mem.findScalar(u8, host_name, ':') != null;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    errdefer out.deinit();
+    const user: std.Uri.Component = uri.user orelse .empty;
+    out.writer.print("{s}://{f}:{f}@{s}{s}{s}", .{
+        scheme,
+        std.fmt.alt(user, .formatUser),
+        std.fmt.alt(std.Uri.Component{ .raw = password }, .formatPassword),
+        if (ipv6) "[" else "",
+        host_name,
+        if (ipv6) "]" else "",
+    }) catch return error.OutOfMemory;
+    if (uri.port) |port| out.writer.print(":{d}", .{port}) catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch error.OutOfMemory;
+}
+
+fn buildProxy(arena: std.mem.Allocator, raw_url: []const u8, password: ?[]const u8) ConfigError!*std.http.Client.Proxy {
+    const uri = try parseProxyUri(arena, raw_url);
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedProxyScheme;
     const host = uri.getHostAlloc(arena) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidProxyUrl,
     };
+    // A password from the environment replaces the one in the URL, so the
+    // profile can store `http://user@proxy` and the secret stays in the
+    // environment. The user still comes from the URL.
+    var credential_uri = uri;
+    if (password != null) credential_uri.password = .{ .raw = password.? };
 
-    const authorization: ?[]const u8 = if (uri.user != null or uri.password != null) blk: {
-        const buffer = try arena.alloc(u8, std.http.Client.basic_authorization.valueLengthFromUri(uri));
-        const written = std.http.Client.basic_authorization.value(uri, buffer);
+    const authorization: ?[]const u8 = if (credential_uri.user != null or credential_uri.password != null) blk: {
+        const buffer = try arena.alloc(u8, std.http.Client.basic_authorization.valueLengthFromUri(credential_uri));
+        const written = std.http.Client.basic_authorization.value(credential_uri, buffer);
         if (written.len != buffer.len) return error.InvalidProxyUrl;
         break :blk buffer;
     } else null;
@@ -887,7 +973,7 @@ test "buildProxy parses scheme, port, and credentials" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const plain = try buildProxy(alloc, "http://user:pass@127.0.0.1:8080");
+    const plain = try buildProxy(alloc, "http://user:pass@127.0.0.1:8080", null);
     try testing.expectEqual(std.http.Client.Protocol.plain, plain.protocol);
     try testing.expectEqualStrings("127.0.0.1", plain.host.bytes);
     try testing.expectEqual(@as(u16, 8080), plain.port);
@@ -895,16 +981,16 @@ test "buildProxy parses scheme, port, and credentials" {
     // The basic value is `Basic <base64(user:pass)>`.
     try testing.expect(std.mem.startsWith(u8, plain.authorization.?, "Basic "));
 
-    const secure = try buildProxy(alloc, "https://proxy.example.com");
+    const secure = try buildProxy(alloc, "https://proxy.example.com", null);
     try testing.expectEqual(std.http.Client.Protocol.tls, secure.protocol);
     try testing.expectEqual(@as(u16, 443), secure.port);
     try testing.expect(secure.authorization == null);
 
-    const schemeless = try buildProxy(alloc, "proxy.example.com:3128");
+    const schemeless = try buildProxy(alloc, "proxy.example.com:3128", null);
     try testing.expectEqual(std.http.Client.Protocol.plain, schemeless.protocol);
     try testing.expectEqual(@as(u16, 3128), schemeless.port);
 
-    try testing.expectError(error.UnsupportedProxyScheme, buildProxy(alloc, "socks5://proxy.example.com:1080"));
+    try testing.expectError(error.UnsupportedProxyScheme, buildProxy(alloc, "socks5://proxy.example.com:1080", null));
 }
 
 test "maskedExplicitUrl hides credentials" {
@@ -1021,6 +1107,86 @@ test "an unknown apply_to name fails resolution instead of narrowing silently" {
 
     try testing.expectError(error.InvalidProxyApplyTo, initFromEnvMap(&map, .{}));
     defer reset();
+}
+
+test "password_env supplies the proxy password for children without touching the stored url" {
+    var map = try testEnv(&.{.{ "PROXY_PASS", "s3cret" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{ .stored = .{
+        .url = "http://user@proxy.example:8080",
+        .password_env = "PROXY_PASS",
+        .apply_to = &.{ .model, .children },
+    } });
+    defer reset();
+
+    try testing.expectEqualStrings("PROXY_PASS", passwordEnv().?.name);
+    try testing.expect(passwordEnv().?.resolved);
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    try testing.expectEqual(@as(usize, max_child_exports), exports.len);
+    try testing.expectEqualStrings("http://user:s3cret@proxy.example:8080", exports[0].value);
+
+    // The secret never reaches a display path, and the user is masked with it.
+    try testing.expect(std.mem.find(u8, maskedExplicitUrl().?, "s3cret") == null);
+    try testing.expectEqualStrings("http://[redacted]@proxy.example:8080", maskedExplicitUrl().?);
+}
+
+test "a password variable with special characters stays one url" {
+    var map = try testEnv(&.{.{ "PROXY_PASS", "p@ss:word" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{ .stored = .{
+        .url = "http://user@[2001:db8::1]:3128",
+        .password_env = "PROXY_PASS",
+        .apply_to = &.{.children},
+    } });
+    defer reset();
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    try testing.expect(exports.len > 0);
+
+    const parsed = try std.Uri.parse(exports[0].value);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try parsed.password.?.toRawMaybeAlloc(arena.allocator());
+    try testing.expectEqualStrings("p@ss:word", decoded);
+    try testing.expectEqualStrings("user", try parsed.user.?.toRawMaybeAlloc(arena.allocator()));
+    try testing.expectEqualStrings("[2001:db8::1]", try parsed.host.?.toRawMaybeAlloc(arena.allocator()));
+    try testing.expectEqual(@as(?u16, 3128), parsed.port);
+}
+
+test "an unset or empty password variable keeps the url password" {
+    var map = try testEnv(&.{.{ "PROXY_PASS", "" }});
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{ .stored = .{
+        .url = "http://user:urlpass@proxy.example:8080",
+        .password_env = "PROXY_PASS",
+        .apply_to = &.{.children},
+    } });
+    defer reset();
+
+    try testing.expectEqualStrings("PROXY_PASS", passwordEnv().?.name);
+    try testing.expect(!passwordEnv().?.resolved);
+
+    var buffer: [max_child_exports]ChildExport = undefined;
+    const exports = childExports(&buffer);
+    try testing.expectEqualStrings("http://user:urlpass@proxy.example:8080", exports[0].value);
+}
+
+test "buildProxy prefers a supplied password over the url one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const from_env = try buildProxy(alloc, "http://user:urlpass@127.0.0.1:8080", "envpass");
+    try testing.expectEqualStrings("Basic dXNlcjplbnZwYXNz", from_env.authorization.?);
+
+    const from_url = try buildProxy(alloc, "http://user:urlpass@127.0.0.1:8080", null);
+    try testing.expectEqualStrings("Basic dXNlcjp1cmxwYXNz", from_url.authorization.?);
 }
 
 test "endpointFor reports a TLS proxy endpoint and nothing without a resolution" {

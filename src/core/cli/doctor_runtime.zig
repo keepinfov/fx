@@ -573,6 +573,16 @@ fn appendProxyCheck(checks: *std.ArrayList(Check), alloc: Allocator, profile_loa
             },
         );
         try appendCheckOwned(checks, alloc, "proxy", .ok, detail);
+        if (proxy_mod.passwordEnv()) |password_env| {
+            if (!password_env.resolved) {
+                const password_detail = try std.fmt.allocPrint(
+                    alloc,
+                    "{s} holds no password; fx then uses the proxy URL as stored",
+                    .{password_env.name},
+                );
+                try appendCheckOwned(checks, alloc, "proxy password", .warn, password_detail);
+            }
+        }
         return;
     }
 

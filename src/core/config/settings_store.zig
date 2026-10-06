@@ -1035,7 +1035,7 @@ test "proxy user patch replaces the url and keeps the rest of the block" {
     var root = try std.json.parseFromSliceLeaky(
         std.json.Value,
         arena.allocator(),
-        "{\"proxy\":{\"url\":\"http://old:3128\",\"no_proxy\":[\".corp\"],\"apply_to\":[\"model\",\"mcp\"]}}",
+        "{\"proxy\":{\"url\":\"http://old:3128\",\"no_proxy\":[\".corp\"],\"apply_to\":[\"model\",\"mcp\"],\"password_env\":\"PROXY_PASS\"}}",
         .{},
     );
     var application = try applyUserPatchToRoot(
@@ -1048,6 +1048,7 @@ test "proxy user patch replaces the url and keeps the rest of the block" {
     try std.testing.expectEqualStrings("http://new:8080", block.get("url").?.string);
     try std.testing.expectEqualStrings(".corp", block.get("no_proxy").?.array.items[0].string);
     try std.testing.expectEqualStrings("mcp", block.get("apply_to").?.array.items[1].string);
+    try std.testing.expectEqualStrings("PROXY_PASS", block.get("password_env").?.string);
 
     application = try applyUserPatchToRoot(
         arena.allocator(),
