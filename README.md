@@ -129,7 +129,7 @@ Route outbound traffic through an HTTP proxy by adding a `proxy` block to `~/.fx
   "proxy": {
     "url": "http://user:pass@proxy.example:8080",
     "no_proxy": ["localhost", ".corp", "10.0.0.0/8"],
-    "apply_to": ["model"] // model, mcp, upgrade, children, web
+    "apply_to": ["model"] // model, mcp, upgrade, children, web, or all
   }
 }
 ```
@@ -140,7 +140,7 @@ fx ask --proxy http://127.0.0.1:8080 --proxy-apply-to model,upgrade "review this
 FX_PROXY=http://127.0.0.1:8080 fx
 ```
 
-`apply_to` defaults to `model`, which covers the AI Gateway, custom model connections, model catalogs, version checks, the permission reviewer, and provider sign-in. `mcp` covers HTTP and SSE MCP transports, `upgrade` covers auto-upgrade and `fx upgrade`, `web` covers `web_fetch`, and `children` exports `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` to shell commands, stdio MCP servers, and skill installs. `children` stays off unless you name it, so child processes keep inheriting your environment.
+`apply_to` defaults to `model`, which covers the AI Gateway, custom model connections, model catalogs, version checks, the permission reviewer, and provider sign-in. `mcp` covers HTTP and SSE MCP transports, `upgrade` covers auto-upgrade and `fx upgrade`, `web` covers `web_fetch`, and `children` exports `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` to shell commands, stdio MCP servers, and skill installs. `all` names every surface at once. An unknown name is an error rather than a silently narrower scope, so a typo cannot leave traffic on a direct connection. `children` stays off unless you name it, so child processes keep inheriting your environment.
 
 The standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables apply to every surface that has no explicit setting, so a narrow `apply_to` leaves the rest of your environment alone. fx reads the layers in this order: `--proxy` with `--no-proxy` and `--proxy-apply-to`, then `FX_PROXY`, `FX_NO_PROXY`, and `FX_PROXY_APPLY_TO`, then `proxy` under `workspaces["<workspace_path>"]`, then the top-level `proxy` block, then the standard variables. `no_proxy` accepts hosts, `.suffix` entries, `*`, `host:port`, IPv4 and IPv6 addresses, and CIDR blocks, and it replaces the default list of `localhost`, `127.0.0.1`, and `::1`.
 

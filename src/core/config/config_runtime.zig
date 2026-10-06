@@ -2043,14 +2043,18 @@ fn parseProxySettings(alloc: Allocator, value: std.json.Value) !proxy_mod.Stored
     }
     if (value.object.get("apply_to")) |apply_value| {
         if (apply_value != .array) return error.InvalidProxyApplyToType;
-        const surfaces = try alloc.alloc(proxy_mod.Surface, apply_value.array.items.len);
-        errdefer alloc.free(surfaces);
-        for (apply_value.array.items, 0..) |item, index| {
+        var surfaces: std.ArrayList(proxy_mod.Surface) = .empty;
+        errdefer surfaces.deinit(alloc);
+        for (apply_value.array.items) |item| {
             if (item != .string) return error.InvalidProxyApplyToEntry;
-            surfaces[index] = std.meta.stringToEnum(proxy_mod.Surface, item.string) orelse
+            const expanded = proxy_mod.surfacesForName(item.string) orelse
                 return error.InvalidProxyApplyToValue;
+            for (expanded) |surface| {
+                if (std.mem.findScalar(proxy_mod.Surface, surfaces.items, surface) != null) continue;
+                try surfaces.append(alloc, surface);
+            }
         }
-        parsed.apply_to = surfaces;
+        parsed.apply_to = try surfaces.toOwnedSlice(alloc);
     }
     return parsed;
 }
@@ -4843,6 +4847,14 @@ test "proxy parses replaces on merge and rejects invalid entries" {
     var web_scope = try parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"apply_to\":[\"web\"]}}");
     defer web_scope.deinit(alloc);
     try std.testing.expectEqualSlices(proxy_mod.Surface, &.{.web}, web_scope.proxy.?.apply_to.?);
+
+    var every_surface = try parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"apply_to\":[\"all\"]}}");
+    defer every_surface.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        proxy_mod.Surface,
+        &proxy_mod.all_surfaces,
+        every_surface.proxy.?.apply_to.?,
+    );
 
     try std.testing.expectError(error.InvalidProxyType, parseSettingsJson(alloc, "{\"proxy\":\"http://127.0.0.1:8080\"}"));
     try std.testing.expectError(error.ProxyUrlRequired, parseSettingsJson(alloc, "{\"proxy\":{\"no_proxy\":[]}}"));

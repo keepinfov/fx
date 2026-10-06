@@ -226,11 +226,10 @@ fn parseProxyApplyToOverride(
     while (iterator.next()) |entry| {
         const trimmed = std.mem.trim(u8, entry, " \t\r\n");
         if (trimmed.len == 0) continue;
-        const surface = std.meta.stringToEnum(proxy_mod.Surface, trimmed) orelse
+        const expanded = proxy_mod.surfacesForName(trimmed) orelse
             return error.InvalidProxyApplyToValue;
-        for (surfaces.items) |existing| {
-            if (existing == surface) break;
-        } else {
+        for (expanded) |surface| {
+            if (std.mem.findScalar(proxy_mod.Surface, surfaces.items, surface) != null) continue;
             try surfaces.append(alloc, surface);
         }
     }
@@ -4688,6 +4687,17 @@ test "proxy flags parse into modifiers and skip command detection" {
         proxy_mod.Surface,
         &.{ .model, .web },
         web_scope.modifiers.proxy_apply_to.?,
+    );
+
+    var all_scope = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--proxy=http://127.0.0.1:8080"),
+        @constCast("--proxy-apply-to=all"),
+    });
+    defer all_scope.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        proxy_mod.Surface,
+        &proxy_mod.all_surfaces,
+        all_scope.modifiers.proxy_apply_to.?,
     );
 
     try std.testing.expectError(

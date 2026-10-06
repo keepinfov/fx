@@ -44,6 +44,23 @@ pub const default_apply_to = &[_]Surface{.model};
 /// Number of surfaces, so callers can size a buffer without hardcoding it.
 pub const max_surfaces = std.meta.fields(Surface).len;
 
+/// Every surface, in declaration order.
+pub const all_surfaces: [max_surfaces]Surface = blk: {
+    var list: [max_surfaces]Surface = undefined;
+    for (std.meta.tags(Surface), 0..) |tag, index| list[index] = tag;
+    break :blk list;
+};
+
+/// The surfaces one `apply_to` entry selects, or null when the name selects
+/// none. `all` selects every surface.
+pub fn surfacesForName(name: []const u8) ?[]const Surface {
+    if (std.mem.eql(u8, name, "all")) return &all_surfaces;
+    const surface = std.meta.stringToEnum(Surface, name) orelse return null;
+    return switch (surface) {
+        inline else => |named| &[_]Surface{named},
+    };
+}
+
 /// Loopback names and addresses are never sent to an explicitly configured
 /// proxy unless the list is replaced. Local model servers (Ollama, LM Studio,
 /// vLLM) and local MCP servers are plain loopback traffic, and routing them
@@ -58,7 +75,7 @@ pub const Config = struct {
     apply_to: []const Surface = default_apply_to,
 };
 
-pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, OutOfMemory };
+pub const ConfigError = error{ InvalidProxyUrl, UnsupportedProxyScheme, InvalidProxyApplyTo, OutOfMemory };
 
 /// Explicit configuration layers, highest priority first. `override_*` carry
 /// per-launch flags, `stored` carries profile settings after the config
@@ -266,7 +283,7 @@ fn resolveAndInstall(env: EnvSource, sources: Sources) ConfigError!void {
 
     // Explicit configuration, highest priority first: FX_PROXY, then stored
     // profile settings. Flags refine whichever one is selected.
-    const from_environment = explicitConfigFromEnv(arena, env);
+    const from_environment = try explicitConfigFromEnv(arena, env);
     var explicit: ?Config = from_environment orelse sources.stored;
     var origin: Origin = if (from_environment != null) .environment else .settings;
     if (override_url) |url| {
@@ -292,19 +309,21 @@ fn resolveAndInstall(env: EnvSource, sources: Sources) ConfigError!void {
     global_state = state;
 }
 
-fn explicitConfigFromEnv(arena: std.mem.Allocator, env: EnvSource) ?Config {
+fn explicitConfigFromEnv(arena: std.mem.Allocator, env: EnvSource) ConfigError!?Config {
     const raw_url = env.get("FX_PROXY") orelse return null;
     const url = std.mem.trim(u8, raw_url, " \t\r\n");
     if (url.len == 0) return null;
 
     const no_proxy = if (env.get("FX_NO_PROXY")) |raw|
-        splitList(arena, raw) catch return null
+        try splitList(arena, raw)
     else
         default_no_proxy;
 
+    // A name that selects no surface is an error: silently dropping it would
+    // leave traffic on a direct connection while the user believes otherwise.
     const apply_to = if (env.get("FX_PROXY_APPLY_TO")) |raw| blk: {
-        const parsed = splitList(arena, raw) catch return null;
-        const surfaces = surfaceList(arena, parsed) catch return null;
+        const parsed = try splitList(arena, raw);
+        const surfaces = try surfaceList(arena, parsed);
         break :blk if (surfaces.len == 0) default_apply_to else surfaces;
     } else default_apply_to;
 
@@ -671,11 +690,11 @@ fn splitList(arena: std.mem.Allocator, raw: []const u8) ConfigError![]const []co
 
 fn surfaceList(arena: std.mem.Allocator, names: []const []const u8) ConfigError![]const Surface {
     var surfaces: std.ArrayList(Surface) = .empty;
+    errdefer surfaces.deinit(arena);
     for (names) |name| {
-        const surface = std.meta.stringToEnum(Surface, name) orelse continue;
-        for (surfaces.items) |existing| {
-            if (existing == surface) break;
-        } else {
+        const expanded = surfacesForName(name) orelse return error.InvalidProxyApplyTo;
+        for (expanded) |surface| {
+            if (std.mem.findScalar(Surface, surfaces.items, surface) != null) continue;
             try surfaces.append(arena, surface);
         }
     }
@@ -961,6 +980,47 @@ test "endpointFor follows the explicit scope, the bypass list, and the target sc
 
     // Children export variables instead of dialing, so they never select one.
     try testing.expect(endpointFor(.children, true, "example.com", 443) == null);
+}
+
+test "apply_to names surfaces and the all shortcut" {
+    var named = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "web,upgrade" },
+    });
+    defer named.deinit();
+    try initFromEnvMap(&named, .{});
+    defer reset();
+
+    var buffer: [max_surfaces]Surface = undefined;
+    try testing.expectEqualSlices(Surface, &.{ .upgrade, .web }, explicitSurfaces(&buffer));
+    try testing.expect(endpointFor(.web, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.model, true, "example.com", 443) == null);
+
+    var everything = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "all" },
+    });
+    defer everything.deinit();
+    try initFromEnvMap(&everything, .{});
+
+    try testing.expectEqualSlices(Surface, &all_surfaces, explicitSurfaces(&buffer));
+    try testing.expect(endpointFor(.model, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.mcp, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.upgrade, true, "example.com", 443) != null);
+    try testing.expect(endpointFor(.web, true, "example.com", 443) != null);
+    // Children still export variables instead of selecting an endpoint.
+    try testing.expect(endpointFor(.children, true, "example.com", 443) == null);
+}
+
+test "an unknown apply_to name fails resolution instead of narrowing silently" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model,fetch" },
+    });
+    defer map.deinit();
+
+    try testing.expectError(error.InvalidProxyApplyTo, initFromEnvMap(&map, .{}));
+    defer reset();
 }
 
 test "endpointFor reports a TLS proxy endpoint and nothing without a resolution" {
