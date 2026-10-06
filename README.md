@@ -119,6 +119,42 @@ fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark
 
 Shell commands run through a supported login shell (`bash`, `zsh`, `sh`, or `dash`). fx resolves it from your passwd entry and falls back to the first installed shell when the configured shell is unsupported or missing. Set `login_shell` to an absolute shell path in `~/.fx/settings.json`, or override it per launch with `FX_LOGIN_SHELL=<path>`. `fx status` reports the resolved shell and `fx doctor` warns when a configured shell is unavailable.
 
+## Outbound proxy
+
+Route outbound traffic through an HTTP proxy by adding a `proxy` block to `~/.fx/settings.json`, or pass it per launch:
+
+```jsonc
+// ~/.fx/settings.json
+{
+  "proxy": {
+    "url": "http://user:pass@proxy.example:8080",
+    "password_env": "PROXY_PASS",
+    "no_proxy": ["localhost", ".corp", "10.0.0.0/8"],
+    "apply_to": ["model"] // model, mcp, upgrade, children, web, or all
+  }
+}
+```
+
+```bash
+fx --proxy http://127.0.0.1:8080
+fx ask --proxy http://127.0.0.1:8080 --proxy-apply-to model,upgrade "review this change"
+FX_PROXY=http://127.0.0.1:8080 fx
+```
+
+`apply_to` defaults to `model`, which covers the AI Gateway, custom model connections, model catalogs, version checks, the permission reviewer, and provider sign-in. `mcp` covers HTTP and SSE MCP transports, `upgrade` covers auto-upgrade and `fx upgrade`, `web` covers `web_fetch`, and `children` exports `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` to shell commands, stdio MCP servers, and skill installs. `all` names every surface at once. An unknown name is an error rather than a silently narrower scope, so a typo cannot leave traffic on a direct connection. `children` stays off unless you name it, so child processes keep inheriting your environment.
+
+`password_env` names an environment variable that holds the proxy password, which wins over a password in `url` and keeps the secret out of the profile and out of `ps`. The user still comes from `url`, so `http://user@proxy.example:8080` plus `password_env` works without storing a password at all. A variable that is unset or empty falls back to whatever `url` carries, and `fx doctor` warns when that happens. Child processes still receive a URL with the resolved password, because that is how every proxy-aware tool reads one.
+
+The standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables apply to every surface that has no explicit setting, so a narrow `apply_to` leaves the rest of your environment alone. fx reads the layers in this order: `--proxy` with `--no-proxy` and `--proxy-apply-to`, then `FX_PROXY`, `FX_NO_PROXY`, and `FX_PROXY_APPLY_TO`, then `proxy` under `workspaces["<workspace_path>"]`, then the top-level `proxy` block, then the standard variables. `no_proxy` accepts hosts, `.suffix` entries, `*`, `host:port`, IPv4 and IPv6 addresses, and CIDR blocks, and it replaces the default list of `localhost`, `127.0.0.1`, and `::1`.
+
+fx fails closed. A proxy that is configured but unusable stops the process instead of opening a direct connection, and only a bypass entry produces one. `fx doctor` reports that failure as a check instead of exiting, so it stays usable when every other command refuses to start.
+
+`web_fetch` resolves, dials, and pins its own sockets so a target cannot slip past the public-address policy. With `web` in scope it sends a plain HTTP request in absolute form, and for HTTPS it asks the proxy for a `CONNECT` tunnel and still verifies the target certificate against the target name, so the proxy can neither read nor alter the request. The target address policy still runs first, which keeps `web_fetch` on public endpoints even behind a proxy, and an `https://` proxy URL is refused for that surface because the fetch transport would have to nest its own TLS session inside one it cannot verify.
+
+The **Proxy** row in `/settings` edits the stored URL and shows it with credentials masked, and a saved change takes effect on the next launch. `/status` lists the effective proxy for each surface, and `fx doctor` names the layer that supplied the URL.
+
+A URL passed on the command line is visible to other users in `ps`, and a `children` proxy exports the URL with its credentials to every child process. Store it in `~/.fx/settings.json`, which fx keeps at mode 0600, when that matters.
+
 ## Embed fx
 
 fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.

@@ -73,6 +73,10 @@ Key rules:
 
 * `src/gateway/` owns provider transport. It must not absorb product-state logic.
 
+* `src/core/shared/proxy.zig` owns the outbound proxy policy. Surfaces get it
+  through the client factory and the child-environment helper instead of
+  reading proxy settings themselves.
+
 * `src/acp/` owns the ACP (Agent Client Protocol) JSON-RPC 2.0 server.
 
 ### Adding a Feature
@@ -128,7 +132,7 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, `permission`, `login_shell`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `permission_mode`, `credential_source`, `permission`, `login_shell`, `proxy`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
 
 Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. A subagent child is an internal ordinary session with its own history. Its parent owns one bounded `subagent/children.json` registry, and the child carries only an immutable owner marker. Child sessions stay out of ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child in that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
 

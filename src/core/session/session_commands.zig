@@ -16,6 +16,7 @@ const permissions = @import("../permissions/permissions.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const prompt_history_runtime = @import("../app/prompt_history_runtime.zig");
 const provider_runtime = @import("../app/provider_runtime.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
@@ -313,6 +314,7 @@ pub fn Commands(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .login_shell = login_shell,
                 .login_shell_source = login_shell_source,
+                .proxy = output_contracts.ProxySnapshot.fromPolicy(),
             }).renderInteractiveBody(app.alloc);
             defer app.alloc.free(text);
             try app.writeDomainNotice(.{ .topic = "status", .tone = .neutral, .body = text }, true);
@@ -348,6 +350,27 @@ pub fn Commands(comptime App: type) type {
                         return;
                     }
                     try saveLoginShellSetting(app, split.word);
+                    return;
+                }
+                try writeSettingsStatus(app);
+                return;
+            }
+
+            if (std.ascii.eqlIgnoreCase(first.word, "proxy")) {
+                const value_split = splitFirstWord(first.rest);
+                if (value_split) |split| {
+                    if (split.rest.len != 0) {
+                        try writeSettingsUsage(app);
+                        return;
+                    }
+                    if (std.ascii.eqlIgnoreCase(split.word, "off") or
+                        std.ascii.eqlIgnoreCase(split.word, "default") or
+                        std.ascii.eqlIgnoreCase(split.word, "none"))
+                    {
+                        try saveProxySetting(app, null);
+                        return;
+                    }
+                    try saveProxySetting(app, split.word);
                     return;
                 }
                 try writeSettingsStatus(app);
@@ -981,7 +1004,7 @@ pub fn Commands(comptime App: type) type {
             const startup_scrollback_label = if (settings.startup_scrollback orelse true) "on" else "off";
             var login_shell_buffer: shell_resolver.LoginShellBuffer = undefined;
             const login_shell = shell_resolver.effectiveLoginShellInto(&login_shell_buffer) orelse "(unresolved)";
-            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}\nlogin_shell: {s}", .{
+            const msg = try std.fmt.allocPrint(app.alloc, "model: {s}\nmodel_config_source: {s}\npermission_mode: {s}\nworkspace: {s}\nstep_limit: {d}\nstartup_scrollback: {s}\nlogin_shell: {s}\nproxy: {s}", .{
                 provider_runtime.model(app),
                 @tagName(detailed.sources.models.get(model_provider.NameKey.fromProvider(.gateway))),
                 permissions.permissionModeDisplayLabel(app.permission_engine.mode),
@@ -989,6 +1012,7 @@ pub fn Commands(comptime App: type) type {
                 app.agent_step_limit,
                 startup_scrollback_label,
                 login_shell,
+                proxy_mod.storedDisplay() orelse "off",
             });
             defer app.alloc.free(msg);
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
@@ -1106,11 +1130,77 @@ pub fn Commands(comptime App: type) type {
             }
         }
 
+        fn saveProxySetting(app: *App, url: ?[]const u8) !void {
+            if (url) |value| {
+                proxy_mod.validateUrl(app.alloc, value) catch |err| {
+                    const message = try std.fmt.allocPrint(
+                        app.alloc,
+                        "Invalid proxy URL: {s}",
+                        .{@errorName(err)},
+                    );
+                    defer app.alloc.free(message);
+                    try app.writeDomainNotice(.{
+                        .topic = "settings",
+                        .tone = .@"error",
+                        .body = message,
+                    }, true);
+                    return;
+                };
+            }
+            const patch: config_runtime.UserSettingsPatch = if (url) |value|
+                .{ .proxy_url = value }
+            else
+                .{ .clear_proxy = true };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, patch);
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| {
+                    try reportUserSettingsFailure(
+                        app,
+                        "proxy",
+                        failure.err,
+                        failure.cleanup,
+                        false,
+                    );
+                    return;
+                },
+                .outcome => |outcome| {
+                    _ = try reportUserSettingsCommit(
+                        app,
+                        "proxy",
+                        patch,
+                        outcome,
+                        null,
+                        false,
+                    );
+                    const masked = if (url) |value| try proxy_mod.maskUrl(app.alloc, value) else null;
+                    defer if (masked) |value| app.alloc.free(value);
+                    var out: std.Io.Writer.Allocating = .init(app.alloc);
+                    defer out.deinit();
+                    if (masked) |value| {
+                        try out.writer.print("proxy: {s}", .{value});
+                    } else {
+                        try out.writer.writeAll("proxy: off; cleared the stored proxy");
+                    }
+                    // The resolution is installed once at startup, so a saved
+                    // change reaches connections only after a restart. The
+                    // display value follows immediately so `/settings` shows
+                    // what was saved.
+                    proxy_mod.setStoredDisplay(url) catch {};
+                    try out.writer.writeAll(" (applies on next launch)");
+                    const msg = try out.toOwnedSlice();
+                    defer app.alloc.free(msg);
+                    try app.writeDomainNotice(.{ .topic = "settings", .tone = .neutral, .body = msg }, true);
+                    return;
+                },
+            }
+        }
+
         fn writeSettingsUsage(app: *App) !void {
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]",
+                .body = "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>] [proxy <url|off>]",
             }, true);
         }
 
@@ -2272,11 +2362,11 @@ test "session_commands handleSettings reports usage and save failures" {
     defer app.deinit();
 
     try Commands(FakeApp).handleSettings(&app, "bogus");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>] [proxy <url|off>]");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off extra");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>] [proxy <url|off>]");
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
@@ -2333,7 +2423,45 @@ test "session_commands handleSettings rejects relative login shell paths" {
     defer app.deinit();
 
     try Commands(FakeApp).handleSettings(&app, "login-shell relative/bash");
-    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>]");
+    try expectTranscriptContains(&app, "usage: /settings [startup-scrollback [on|off]] [login-shell <path|default>] [proxy <url|off>]");
+}
+
+test "session_commands handleSettings saves and clears the proxy" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/test-model");
+    defer app.deinit();
+
+    try Commands(FakeApp).handleSettings(&app, "proxy http://user:secret@127.0.0.1:8080");
+    try expectTranscriptContains(&app, "proxy: http://[redacted]@127.0.0.1:8080 (applies on next launch)");
+    try std.testing.expect(std.mem.find(u8, app.text(), "secret") == null);
+
+    var saved = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer saved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("http://user:secret@127.0.0.1:8080", saved.proxy.?.url);
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "proxy socks5://127.0.0.1:1080");
+    try expectTranscriptContains(&app, "Invalid proxy URL: UnsupportedProxyScheme");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleSettings(&app, "proxy off");
+    try expectTranscriptContains(&app, "proxy: off; cleared the stored proxy (applies on next launch)");
+
+    var cleared = try config_runtime.loadMergedSettings(std.testing.allocator, workspace_root);
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(cleared.proxy == null);
 }
 
 test "session_commands handleModel reports current model for empty query" {

@@ -6,6 +6,7 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const session_store = @import("../session/session_store.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const types = @import("../shared/types.zig");
@@ -101,6 +102,7 @@ pub fn collect(
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendGhCheck(&checks, alloc);
         try appendLoginShellCheck(&checks, alloc, null);
+        try appendProxyCheck(&checks, alloc, false);
 
         snapshot.checks = try checks.toOwnedSlice(alloc);
         return snapshot;
@@ -114,6 +116,17 @@ pub fn collect(
         snapshot.provider,
         detailed.settings.credential_source,
     );
+
+    // A stored proxy is the destination for model traffic, so the policy has to
+    // cover this process before the checks reach the network. A stored value
+    // the process cannot apply is reported instead of ending the run: doctor
+    // exists to explain exactly that failure.
+    proxy_mod.initResolved(.{
+        .stored = if (detailed.settings.proxy) |*proxy| proxy.config() else null,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => proxy_mod.noteFailure(err),
+    };
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
@@ -133,6 +146,7 @@ pub fn collect(
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
     try appendLoginShellCheck(&checks, alloc, detailed.settings.login_shell);
+    try appendProxyCheck(&checks, alloc, true);
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
     return snapshot;
@@ -514,6 +528,69 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         return;
     }
     try appendCheck(checks, alloc, "gh", .warn, "GitHub CLI not found in PATH; publish workflows unavailable");
+}
+
+/// Reports the effective outbound proxy policy, or the configuration failure
+/// that stopped the process-wide resolution.
+fn appendProxyCheck(checks: *std.ArrayList(Check), alloc: Allocator, profile_loaded: bool) !void {
+    if (proxy_mod.failure()) |err| {
+        const detail = try std.fmt.allocPrint(
+            alloc,
+            "invalid proxy configuration ({s}); fx refuses network work until it is fixed",
+            .{@errorName(err)},
+        );
+        try appendCheckOwned(checks, alloc, "proxy", .fail, detail);
+        return;
+    }
+
+    if (!profile_loaded) {
+        const detail = if (proxy_mod.maskedExplicitUrl() != null)
+            "profile settings are unreadable; only the environment proxy is applied"
+        else
+            "profile settings are unreadable; no stored proxy is applied";
+        try appendCheck(checks, alloc, "proxy", .warn, detail);
+        return;
+    }
+
+    if (proxy_mod.explicitOrigin()) |origin| {
+        var buffer: [proxy_mod.max_surfaces]proxy_mod.Surface = undefined;
+        const surfaces = proxy_mod.explicitSurfaces(&buffer);
+        var names: [proxy_mod.max_surfaces][]const u8 = undefined;
+        for (surfaces, 0..) |surface, index| names[index] = @tagName(surface);
+        const joined = try std.mem.join(alloc, ", ", names[0..surfaces.len]);
+        defer alloc.free(joined);
+        const detail = try std.fmt.allocPrint(
+            alloc,
+            "{s} proxy {s} covers {s}; other surfaces {s}",
+            .{
+                proxy_mod.originLabel(origin),
+                proxy_mod.effectiveDisplay(),
+                joined,
+                if (proxy_mod.environmentConfigured())
+                    "use the standard proxy variables"
+                else
+                    "connect directly",
+            },
+        );
+        try appendCheckOwned(checks, alloc, "proxy", .ok, detail);
+        if (proxy_mod.passwordEnv()) |password_env| {
+            if (!password_env.resolved) {
+                const password_detail = try std.fmt.allocPrint(
+                    alloc,
+                    "{s} holds no password; fx then uses the proxy URL as stored",
+                    .{password_env.name},
+                );
+                try appendCheckOwned(checks, alloc, "proxy password", .warn, password_detail);
+            }
+        }
+        return;
+    }
+
+    if (proxy_mod.environmentConfigured()) {
+        try appendCheck(checks, alloc, "proxy", .ok, "no stored proxy; the standard proxy variables cover every surface");
+        return;
+    }
+    try appendCheck(checks, alloc, "proxy", .ok, "direct connections; no proxy configured");
 }
 
 fn appendLoginShellCheck(

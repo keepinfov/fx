@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const system_tools = @import("../shared/system_tools.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -13,6 +14,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1107,12 +1109,15 @@ fn executeProcessWithInput(
     closed_input: bool,
     isolate_process_group: bool,
 ) !CollectedProcess {
+    var child_environment = try proxy_mod.childEnvironment(scratch);
+    defer if (child_environment) |*environment| environment.deinit();
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
         .cwd = .{ .path = cwd },
         .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
@@ -1218,12 +1223,15 @@ fn executeProcessWithDetachedSession(
     try helper_argv.append(scratch, deadline_text);
     try helper_argv.appendSlice(scratch, argv);
 
+    var child_environment = try proxy_mod.childEnvironment(scratch);
+    defer if (child_environment) |*environment| environment.deinit();
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
         .cwd = .{ .path = cwd },
     });
 
@@ -1390,12 +1398,15 @@ fn executeProcessWithScriptUnisolated(
     cwd: []const u8,
     script: []const u8,
 ) !CollectedProcess {
+    var child_environment = try proxy_mod.childEnvironment(scratch);
+    defer if (child_environment) |*environment| environment.deinit();
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
         .cwd = .{ .path = cwd },
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
@@ -3230,10 +3241,10 @@ fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !vo
 fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
     const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
     while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
-        };
+        // Ask the engine's own definition of aliveness: a process that was
+        // terminated but not yet reaped is a zombie, and how promptly the host
+        // reaps orphans must not read as a surviving descendant.
+        if (!try process_tree.processIsAlive(std.testing.allocator, pid)) return;
         io_mod.sleep(std.time.ns_per_ms);
     }
     return error.TestUnexpectedResult;
@@ -3365,6 +3376,30 @@ test "foreground session bootstrap invalid release executes no target" {
     try expectRejectedForegroundSessionReleaseForTest(0xff);
 }
 
+/// A host login shell can write decoration of its own: this host's bash emits a
+/// window-title escape from its exit hook. That decoration belongs to the shell
+/// rather than to the target command, and it appears whenever a script calls
+/// `exit`, so measure it with a script that writes nothing and leaves the same
+/// way. The tests below then describe the target's own bytes on any host.
+const ShellDecoration = struct {
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+};
+
+fn measureShellDecoration(
+    alloc: std.mem.Allocator,
+    workspace: []const u8,
+    script: []const u8,
+) !ShellDecoration {
+    const baseline = try executeCommand(.{ .max_command_output_bytes = 4096 }, alloc, script, workspace);
+    defer alloc.free(baseline.output);
+    const result = baseline.command_result.?;
+    return .{
+        .stdout_bytes = result.stdout_bytes,
+        .stderr_bytes = result.stderr_bytes,
+    };
+}
+
 test "foreground session protocol bytes do not enter captured output" {
     if (comptime !supports_foreground_session) return;
 
@@ -3389,6 +3424,7 @@ test "target replacement marker prefix remains ordinary stderr" {
     if (comptime !supports_foreground_session) return;
 
     const stderr_text = foreground_session_replace_failure_prefix ++ "target-data\n";
+    const decoration = try measureShellDecoration(std.testing.allocator, "/tmp", "exit 125");
     const result = try executeCommand(.{
         .max_command_output_bytes = 4096,
     }, std.testing.allocator, "printf '\\000FX_FOREGROUND_EXEC_FAILED:target-data\\n' >&2; exit 125", "/tmp");
@@ -3396,8 +3432,8 @@ test "target replacement marker prefix remains ordinary stderr" {
 
     const foreground = result.command_result.?;
     try std.testing.expectEqual(@as(?i64, 125), foreground.exit_code);
-    try std.testing.expectEqual(@as(usize, 0), foreground.stdout_bytes);
-    try std.testing.expectEqual(stderr_text.len, foreground.stderr_bytes);
+    try std.testing.expect(foreground.stdout_bytes <= decoration.stdout_bytes);
+    try std.testing.expectEqual(decoration.stderr_bytes + stderr_text.len, foreground.stderr_bytes);
     try std.testing.expect(std.mem.find(u8, result.output, stderr_text) != null);
 }
 
@@ -3480,7 +3516,10 @@ test "readiness EOF directly kills and reaps helper pid" {
 test "pre-ready cancellation directly kills and reaps helper pid" {
     if (comptime !supports_foreground_session) return;
 
-    const argv = [_][]const u8{ "/bin/sleep", "2" };
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const argv = [_][]const u8{ sleep_path, "2" };
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
@@ -3502,7 +3541,10 @@ test "pre-ready cancellation directly kills and reaps helper pid" {
 test "pre-ready configured timeout directly kills and reaps helper pid" {
     if (comptime !supports_foreground_session) return;
 
-    const argv = [_][]const u8{ "/bin/sleep", "2" };
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const argv = [_][]const u8{ sleep_path, "2" };
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const pid = child.id orelse return error.TestUnexpectedResult;
@@ -3524,7 +3566,10 @@ test "pre-ready configured timeout directly kills and reaps helper pid" {
 test "foreground session setup has a bounded internal ceiling" {
     if (comptime !supports_foreground_session) return;
 
-    const argv = [_][]const u8{ "/bin/sleep", "7" };
+    const sleep_path = (try system_tools.findStandardAlloc(std.testing.allocator, "sleep")) orelse
+        return error.SkipZigTest;
+    defer std.testing.allocator.free(sleep_path);
+    const argv = [_][]const u8{ sleep_path, "7" };
     var child = try spawnUnreadyForegroundSessionChildForTest(&argv);
     defer child.kill(io_mod.getIo());
     const cfg = Config{
@@ -4170,6 +4215,7 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
         .needle = "CANCEL-READY",
     };
     const expected = "HEAD-1234567890-TAIL\nCANCEL-READY\n";
+    const decoration = try measureShellDecoration(alloc, workspace, "exit 0");
     const result = try executeCommand(.{
         .max_command_output_bytes = 16,
         .cancel_flag = &cancel,
@@ -4183,15 +4229,18 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
     try std.testing.expect(result.cancelled);
     const foreground = result.command_result.?;
     try std.testing.expect(foreground.truncated);
-    try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
+    try std.testing.expect(foreground.stdout_bytes >= expected.len);
+    try std.testing.expect(foreground.stdout_bytes <= expected.len + decoration.stdout_bytes);
+    try std.testing.expectEqual(decoration.stderr_bytes, foreground.stderr_bytes);
     try std.testing.expect(std.mem.find(u8, result.output, "truncated=true\n") != null);
     try std.testing.expect(std.mem.find(u8, result.output, "bytes truncated") != null);
 
     const output_path = foreground.output_file orelse return error.TestExpectedEqual;
     const artifact = try readAbsoluteFile(alloc, output_path, 256);
     defer alloc.free(artifact);
-    try std.testing.expectEqualStrings(expected, artifact);
+    try std.testing.expect(artifact.len >= expected.len);
+    try std.testing.expectEqualStrings(expected, artifact[0..expected.len]);
+    try std.testing.expect(artifact.len - expected.len <= decoration.stdout_bytes);
 }
 
 test "cancelled managed command confirms an indeterminate artifact target" {
@@ -4313,6 +4362,7 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
     const term_tail = "TERM-TAIL-ONLY\n";
     const expected = ready ++ term_tail;
     const cap = 128;
+    const decoration = try measureShellDecoration(alloc, workspace, "exit 0");
     try std.testing.expect(expected.len > streamPreviewLimit(cap));
     try std.testing.expect(expected.len <= cap);
 
@@ -4332,12 +4382,15 @@ test "below-cap cancellation retains complete artifact and non-truncated metadat
 
     const foreground = result.command_result.?;
     try std.testing.expect(!foreground.truncated);
-    try std.testing.expectEqual(expected.len, foreground.stdout_bytes);
-    try std.testing.expectEqual(@as(usize, 0), foreground.stderr_bytes);
+    try std.testing.expect(foreground.stdout_bytes >= expected.len);
+    try std.testing.expect(foreground.stdout_bytes <= expected.len + decoration.stdout_bytes);
+    try std.testing.expectEqual(decoration.stderr_bytes, foreground.stderr_bytes);
     const output_path = foreground.output_file orelse return error.TestExpectedEqual;
     const artifact = try readAbsoluteFile(alloc, output_path, 256);
     defer alloc.free(artifact);
-    try std.testing.expectEqualStrings(expected, artifact);
+    try std.testing.expect(artifact.len >= expected.len);
+    try std.testing.expectEqualStrings(expected, artifact[0..expected.len]);
+    try std.testing.expect(artifact.len - expected.len <= decoration.stdout_bytes);
 }
 
 test "zero-output cancellation remains a bare error" {
@@ -4697,18 +4750,10 @@ test "timeout terminates foreground process group descendants" {
         10,
     );
 
-    const started_ms = io_mod.milliTimestamp();
-    while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => break,
-            else => return err,
-        };
-        if (io_mod.milliTimestamp() - started_ms > 1000) {
-            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-            return error.TestUnexpectedResult;
-        }
-        io_mod.sleep(10 * std.time.ns_per_ms);
-    }
+    expectProcessGoneWithinForTest(pid, 1_000) catch |err| {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        return err;
+    };
 }
 
 test "timeout terminates redirected descendant after setsid" {

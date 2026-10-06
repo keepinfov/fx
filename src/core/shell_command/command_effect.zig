@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_lex = @import("command_lex.zig");
+const system_tools = @import("../shared/system_tools.zig");
 
 const max_command_bytes = 8 * 1024;
 const max_ls_operands = 64;
@@ -1056,7 +1057,11 @@ fn buildPrintfCommand(
 fn expectNativePrintfEquivalent(command: []const u8, target_os: std.Target.Os.Tag) !void {
     var admission = try expectDirect(command, target_os);
     defer admission.deinit(std.testing.allocator);
-    const argv = admission.direct_read_only.stages[0].argv;
+    const planned = admission.direct_read_only.stages[0].argv;
+    const path = try system_tools.readOnlyPathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const argv = try system_tools.resolvePlannedArgvAlloc(std.testing.allocator, planned, path);
+    defer system_tools.freeResolvedArgvAlloc(std.testing.allocator, planned, argv);
 
     const shell_argv = [_][]const u8{ "/bin/sh", "-lc", command };
     const shell_result = try std.process.run(std.testing.allocator, std.testing.io, .{
@@ -1632,7 +1637,9 @@ test "planner native ls policy preserves reviewed target behavior" {
     defer alloc.free(cwd);
     var environment = std.process.Environ.Map.init(alloc);
     defer environment.deinit();
-    try environment.put("PATH", "/usr/bin:/bin");
+    const read_only_path = try system_tools.readOnlyPathAlloc(alloc);
+    defer alloc.free(read_only_path);
+    try environment.put("PATH", read_only_path);
     try environment.put("LC_ALL", "C");
     try environment.put("LANG", "C");
 
@@ -1654,8 +1661,10 @@ test "planner native ls policy preserves reviewed target behavior" {
         var admission = try expectDirect(case.command, builtin.os.tag);
         defer admission.deinit(alloc);
         const stage = admission.direct_read_only.stages[0];
+        const stage_argv = try system_tools.resolvePlannedArgvAlloc(alloc, stage.argv, read_only_path);
+        defer system_tools.freeResolvedArgvAlloc(alloc, stage.argv, stage_argv);
         const result = try std.process.run(alloc, std.testing.io, .{
-            .argv = stage.argv,
+            .argv = stage_argv,
             .cwd = .{ .path = cwd },
             .environ_map = &environment,
         });
@@ -1677,8 +1686,11 @@ test "planner native ls policy preserves reviewed target behavior" {
 
     var hostile_failure = try expectDirect("ls '\x1bmissing'", builtin.os.tag);
     defer hostile_failure.deinit(alloc);
+    const hostile_planned = hostile_failure.direct_read_only.stages[0].argv;
+    const hostile_argv = try system_tools.resolvePlannedArgvAlloc(alloc, hostile_planned, read_only_path);
+    defer system_tools.freeResolvedArgvAlloc(alloc, hostile_planned, hostile_argv);
     const hostile_failure_result = try std.process.run(alloc, std.testing.io, .{
-        .argv = hostile_failure.direct_read_only.stages[0].argv,
+        .argv = hostile_argv,
         .cwd = .{ .path = cwd },
         .environ_map = &environment,
     });
@@ -1690,8 +1702,11 @@ test "planner native ls policy preserves reviewed target behavior" {
 
     var bare = try expectDirect("ls", builtin.os.tag);
     defer bare.deinit(alloc);
+    const bare_planned = bare.direct_read_only.stages[0].argv;
+    const bare_argv = try system_tools.resolvePlannedArgvAlloc(alloc, bare_planned, read_only_path);
+    defer system_tools.freeResolvedArgvAlloc(alloc, bare_planned, bare_argv);
     const bare_result = try std.process.run(alloc, std.testing.io, .{
-        .argv = bare.direct_read_only.stages[0].argv,
+        .argv = bare_argv,
         .cwd = .{ .path = cwd },
         .environ_map = &environment,
     });
@@ -1712,8 +1727,11 @@ test "planner native ls policy preserves reviewed target behavior" {
     for (expected_numeric_argv, numeric_stage.argv) |expected, actual| {
         try std.testing.expectEqualStrings(expected, actual);
     }
+    const numeric_planned = numeric_stage.argv;
+    const numeric_argv = try system_tools.resolvePlannedArgvAlloc(alloc, numeric_planned, read_only_path);
+    defer system_tools.freeResolvedArgvAlloc(alloc, numeric_planned, numeric_argv);
     const numeric_result = try std.process.run(alloc, std.testing.io, .{
-        .argv = numeric_stage.argv,
+        .argv = numeric_argv,
         .cwd = .{ .path = cwd },
         .environ_map = &environment,
     });

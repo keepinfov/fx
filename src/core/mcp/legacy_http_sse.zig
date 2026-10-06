@@ -2,6 +2,7 @@ const std = @import("std");
 const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const legacy_sse = @import("legacy_sse.zig");
 const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
@@ -463,10 +464,7 @@ pub const Client = struct {
 
         const uri = std.Uri.parse(self.discovery_url) catch
             return error.InvalidEndpoint;
-        var http_client: std.http.Client = .{
-            .allocator = self.shared_allocator,
-            .io = io_mod.getIo(),
-        };
+        var http_client = proxy_mod.initClient(self.shared_allocator, .mcp, self.discovery_url);
         defer http_client.deinit();
         var http_request = try http_client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
@@ -745,7 +743,7 @@ fn postMessageCore(
     }
 
     const uri = std.Uri.parse(client.endpoint.?) catch return error.InvalidEndpoint;
-    var http_client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
+    var http_client = proxy_mod.initClient(alloc, .mcp, client.endpoint.?);
     defer http_client.deinit();
     var request = try http_client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const io_mod = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const skill_commands = @import("../core/skills/skill_commands.zig");
 const skill_contract = @import("../core/skills/skill_contract.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -273,10 +274,13 @@ fn installFromGitHub(alloc: Allocator, skills_dir: []const u8, url: []const u8, 
     defer alloc.free(git_url);
 
     const argv = [_][]const u8{ "git", "clone", "--depth", "1", git_url, tmp_dir };
+    var child_environment = try proxy_mod.childEnvironment(alloc);
+    defer if (child_environment) |*environment| environment.deinit();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = &argv,
         .stderr = .pipe,
         .stdout = .pipe,
+        .environ_map = if (child_environment) |*environment| environment else null,
     });
 
     var child_needs_cleanup = true;

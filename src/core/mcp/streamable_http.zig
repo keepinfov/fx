@@ -4,6 +4,7 @@ const mcp_contract = @import("mcp_contract.zig");
 const operation_control = @import("operation_control.zig");
 const protocol_negotiation = @import("protocol_negotiation.zig");
 const io_mod = @import("../shared/io.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -343,10 +344,7 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
     defer prepared.deinit(alloc);
 
     const uri = std.Uri.parse(options.url) catch return error.InvalidEndpoint;
-    var client: std.http.Client = .{
-        .allocator = alloc,
-        .io = io_mod.getIo(),
-    };
+    var client = proxy_mod.initClient(alloc, .mcp, options.url);
     defer client.deinit();
 
     var request = try client.request(.POST, uri, .{

@@ -22,12 +22,14 @@ pub const Runtime = struct {
         return .{ .alloc = alloc };
     }
 
-    /// Creates the gateway pool once. Safe to call repeatedly. Allocation
-    /// failure leaves the pool absent rather than failing the caller.
-    pub fn ensureGatewayHttpPool(self: *Self) void {
+    /// Creates the gateway pool once for `url`'s origin, applying the model
+    /// proxy policy before any connection can be warmed. Safe to call
+    /// repeatedly. Allocation failure leaves the pool absent rather than
+    /// failing the caller.
+    pub fn ensureGatewayHttpPool(self: *Self, url: []const u8) void {
         if (self.gateway_http_pool != null) return;
         const pool = self.alloc.create(http_pool.HttpPool) catch return;
-        pool.* = http_pool.HttpPool.init(self.alloc);
+        pool.* = http_pool.HttpPool.initForUrl(self.alloc, .model, url);
         self.gateway_http_pool = pool;
     }
 

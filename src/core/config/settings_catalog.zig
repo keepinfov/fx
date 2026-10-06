@@ -37,6 +37,7 @@ pub const SettingId = enum {
     startup_scrollback,
     prompt_history,
     login_shell,
+    proxy,
 };
 
 pub const Spec = struct {
@@ -64,6 +65,10 @@ pub const Snapshot = struct {
     sound_level: []const u8 = "on",
     /// Configured login shell path, or "default" when passwd applies.
     login_shell: []const u8 = "default",
+    /// Configured outbound proxy with credentials masked, or "off" when no
+    /// explicit proxy is configured. The standard proxy variables are not part
+    /// of this row because `/settings` edits only what fx stores.
+    proxy: []const u8 = "off",
 
     pub fn value(self: Snapshot, id: SettingId) []const u8 {
         return switch (id) {
@@ -81,6 +86,7 @@ pub const Snapshot = struct {
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
             .login_shell => self.login_shell,
+            .proxy => self.proxy,
         };
     }
 };
@@ -273,6 +279,7 @@ const specs = [_]Spec{
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
     .{ .id = .login_shell, .category = .advanced, .label = "Login shell", .description = "Choose the shell used for user-login commands; press enter to edit" },
+    .{ .id = .proxy, .category = .advanced, .label = "Proxy", .description = "Route outbound traffic through a proxy; press enter to edit" },
 };
 
 const on_off_options = [_][]const u8{ "off", "on" };
@@ -358,7 +365,7 @@ pub fn changeAt(snapshot: *const Snapshot, id: SettingId, option_index: usize) ?
 
 fn staticOptionsFor(id: SettingId) []const []const u8 {
     return switch (id) {
-        .model, .effort, .login_shell => &.{},
+        .model, .effort, .login_shell, .proxy => &.{},
         .fast_mode,
         .statusline_context,
         .statusline_session,
@@ -424,11 +431,11 @@ test "settings catalog projects grouped searchable preferences" {
         .sound_level = "on",
     };
 
-    try std.testing.expectEqual(@as(usize, 14), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 15), filteredCount(snapshot, .all, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 5), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
-    try std.testing.expectEqual(@as(usize, 3), filteredCount(snapshot, .advanced, ""));
+    try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .advanced, ""));
 
     const current_model = itemAt(snapshot, .all, "glm 5.2", 0).?;
     try std.testing.expectEqual(SettingId.model, current_model.id);
@@ -553,6 +560,20 @@ test "settings catalog exposes the login shell as an edit-only row" {
 
     const fallback: Snapshot = .{};
     try std.testing.expectEqualStrings("default", fallback.value(.login_shell));
+}
+
+test "settings catalog exposes the proxy as an edit-only row" {
+    const snapshot: Snapshot = .{ .proxy = "http://[redacted]@127.0.0.1:8080" };
+    const item = itemAt(snapshot, .advanced, "proxy", 0).?;
+
+    try std.testing.expectEqual(SettingId.proxy, item.id);
+    try std.testing.expectEqualStrings("Proxy", item.label);
+    try std.testing.expectEqualStrings("http://[redacted]@127.0.0.1:8080", item.value);
+    try std.testing.expectEqual(@as(usize, 0), optionCount(&snapshot, .proxy));
+    try std.testing.expect(changeAt(&snapshot, .proxy, 0) == null);
+
+    const fallback: Snapshot = .{};
+    try std.testing.expectEqualStrings("off", fallback.value(.proxy));
 }
 
 test "notification level keeps the existing off on and max policy" {

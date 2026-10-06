@@ -7,6 +7,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const permissions = @import("../permissions/permissions.zig");
+const proxy_mod = @import("../shared/proxy.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
 const session_store = @import("../session/session_store.zig");
@@ -626,6 +627,58 @@ pub const McpLocalSnapshot = struct {
     }
 };
 
+/// Effective outbound proxy policy, per surface. Values are borrowed from the
+/// process-wide resolution, so a snapshot stays valid for the process lifetime.
+pub const ProxySnapshot = struct {
+    /// Explicit proxy URL with credentials masked, or null when only the
+    /// standard variables route traffic.
+    url: ?[]const u8 = null,
+    /// Where the explicit URL came from, or null when none is configured.
+    origin: ?[]const u8 = null,
+    /// Whether the standard proxy variables provide a fallback.
+    environment: bool = false,
+    /// `configured`, `environment`, or `off` for each surface.
+    model: []const u8 = "off",
+    mcp: []const u8 = "off",
+    upgrade: []const u8 = "off",
+    children: []const u8 = "off",
+    web: []const u8 = "off",
+
+    /// Reads the installed policy. No allocation.
+    pub fn fromPolicy() ProxySnapshot {
+        return .{
+            .url = proxy_mod.maskedExplicitUrl(),
+            .origin = if (proxy_mod.explicitOrigin()) |origin| proxy_mod.originLabel(origin) else null,
+            .environment = proxy_mod.environmentConfigured(),
+            .model = proxy_mod.sourceLabel(proxy_mod.sourceFor(.model)),
+            .mcp = proxy_mod.sourceLabel(proxy_mod.sourceFor(.mcp)),
+            .upgrade = proxy_mod.sourceLabel(proxy_mod.sourceFor(.upgrade)),
+            .children = proxy_mod.sourceLabel(proxy_mod.sourceFor(.children)),
+            .web = proxy_mod.sourceLabel(proxy_mod.sourceFor(.web)),
+        };
+    }
+
+    /// One-line summary of the effective policy.
+    pub fn value(self: ProxySnapshot) []const u8 {
+        if (self.url) |url| return url;
+        return if (self.environment) "environment" else "off";
+    }
+
+    /// `model:configured mcp:configured upgrade:environment children:environment`.
+    pub fn surfacesLine(self: ProxySnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("model:{s} mcp:{s} upgrade:{s} children:{s} web:{s}", .{
+            self.model,
+            self.mcp,
+            self.upgrade,
+            self.children,
+            self.web,
+        });
+        return try out.toOwnedSlice();
+    }
+};
+
 pub const StatusSnapshot = struct {
     model: []const u8,
     /// Where startup found `model`: FX_MODEL, settings, or default.
@@ -651,6 +704,9 @@ pub const StatusSnapshot = struct {
     /// Where the configured login shell came from: `env`, `settings`, or
     /// `passwd`.
     login_shell_source: []const u8 = "passwd",
+    /// Outbound proxy policy. Null omits the rows for snapshots that do not
+    /// report proxy state.
+    proxy: ?ProxySnapshot = null,
 
     pub fn render(self: StatusSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -711,6 +767,17 @@ pub const StatusSnapshot = struct {
             try out.writer.print("[status] login_shell={s}\n", .{login_shell});
             try out.writer.print("[status] login_shell_source={s}\n", .{self.login_shell_source});
         }
+        if (self.proxy) |proxy| {
+            try out.writer.writeAll("[status] proxy=");
+            try writeTerminalSafe(&out.writer, alloc, proxy.value());
+            try out.writer.writeByte('\n');
+            if (proxy.origin) |origin| {
+                try out.writer.print("[status] proxy_origin={s}\n", .{origin});
+            }
+            const surfaces = try proxy.surfacesLine(alloc);
+            defer alloc.free(surfaces);
+            try out.writer.print("[status] proxy_surfaces={s}\n", .{surfaces});
+        }
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
@@ -747,6 +814,17 @@ pub const StatusSnapshot = struct {
         if (self.login_shell) |login_shell| {
             try out.writer.print("login_shell={s}\n", .{login_shell});
             try out.writer.print("login_shell_source={s}\n", .{self.login_shell_source});
+        }
+        if (self.proxy) |proxy| {
+            try out.writer.writeAll("proxy=");
+            try writeTerminalSafe(&out.writer, alloc, proxy.value());
+            try out.writer.writeByte('\n');
+            if (proxy.origin) |origin| {
+                try out.writer.print("proxy_origin={s}\n", .{origin});
+            }
+            const surfaces = try proxy.surfacesLine(alloc);
+            defer alloc.free(surfaces);
+            try out.writer.print("proxy_surfaces={s}\n", .{surfaces});
         }
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -854,6 +932,26 @@ pub const StatusSnapshot = struct {
             try std.json.Stringify.value(login_shell, .{}, writer);
             try writer.writeAll(",\"login_shell_source\":");
             try std.json.Stringify.value(self.login_shell_source, .{}, writer);
+        }
+        if (self.proxy) |proxy| {
+            try writer.writeAll(",\"proxy\":{\"value\":");
+            try std.json.Stringify.value(proxy.value(), .{}, writer);
+            try writer.writeAll(",\"url\":");
+            if (proxy.url) |url| {
+                try std.json.Stringify.value(url, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.writeAll(",\"origin\":");
+            if (proxy.origin) |origin| {
+                try std.json.Stringify.value(origin, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.print(
+                ",\"surfaces\":{{\"model\":\"{s}\",\"mcp\":\"{s}\",\"upgrade\":\"{s}\",\"children\":\"{s}\",\"web\":\"{s}\"}}}}",
+                .{ proxy.model, proxy.mcp, proxy.upgrade, proxy.children, proxy.web },
+            );
         }
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
@@ -2163,6 +2261,72 @@ test "status snapshot renders the resolved login shell and its source" {
         u8,
         json,
         "\"login_shell\":\"/bin/bash\",\"login_shell_source\":\"settings\"",
+    ) != null);
+}
+
+test "status snapshot renders the proxy policy per surface" {
+    const snapshot = StatusSnapshot{
+        .model = "alpha",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+        .proxy = .{
+            .url = "http://[redacted]@127.0.0.1:8080",
+            .origin = "settings",
+            .environment = true,
+            .model = "configured",
+            .mcp = "configured",
+            .upgrade = "environment",
+            .children = "environment",
+            .web = "environment",
+        },
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "[status] proxy=http://[redacted]@127.0.0.1:8080\n[status] proxy_origin=settings\n[status] proxy_surfaces=model:configured mcp:configured upgrade:environment children:environment web:environment\n",
+    ) != null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"proxy\":{\"value\":\"http://[redacted]@127.0.0.1:8080\",\"url\":\"http://[redacted]@127.0.0.1:8080\",\"origin\":\"settings\",\"surfaces\":{\"model\":\"configured\",\"mcp\":\"configured\",\"upgrade\":\"environment\",\"children\":\"environment\",\"web\":\"environment\"}}",
+    ) != null);
+}
+
+test "status snapshot reports proxy absence without an explicit url" {
+    const snapshot = StatusSnapshot{
+        .model = "alpha",
+        .permission_mode = .ask,
+        .workspace_root = "/tmp/fx",
+        .history_turns = 0,
+        .session_permission_grants = 0,
+        .agent_step_limit = 24,
+        .proxy = .{ .environment = false },
+    };
+
+    const text = try snapshot.renderText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(
+        u8,
+        text,
+        "[status] proxy=off\n[status] proxy_surfaces=model:off mcp:off upgrade:off children:off web:off\n",
+    ) != null);
+    try std.testing.expect(std.mem.find(u8, text, "proxy_origin") == null);
+
+    const json = try snapshot.renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.find(
+        u8,
+        json,
+        "\"proxy\":{\"value\":\"off\",\"url\":null,\"origin\":null,",
     ) != null);
 }
 

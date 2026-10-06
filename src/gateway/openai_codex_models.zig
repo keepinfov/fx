@@ -4,6 +4,7 @@ const credentials = @import("../core/auth/credentials.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const proxy_mod = @import("../core/shared/proxy.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
@@ -175,7 +176,7 @@ const FetchOperation = struct {
     account_id: ?[]const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
-        var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
+        var client = proxy_mod.initClient(self.alloc, .model, self.url);
         defer client.deinit();
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);

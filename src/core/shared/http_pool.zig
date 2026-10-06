@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
+const proxy_mod = @import("proxy.zig");
 
 /// Long-lived HTTP client wrapper that keeps std's ConnectionPool alive
 /// across requests to one product origin. std already implements acquire,
@@ -39,6 +40,16 @@ pub const HttpPool = struct {
 
     pub fn init(alloc: std.mem.Allocator) HttpPool {
         return .{ .client = .{ .allocator = alloc, .io = io_mod.getIo() } };
+    }
+
+    /// Pool for one origin with the proxy policy already applied. Call this
+    /// instead of `init` on production paths: std reads the client proxy
+    /// fields without a lock while connecting, so the policy must be in place
+    /// before `warmAsync` or the first borrow.
+    pub fn initForUrl(alloc: std.mem.Allocator, surface: proxy_mod.Surface, url: []const u8) HttpPool {
+        var pool = init(alloc);
+        proxy_mod.applyToClient(&pool.client, surface, url);
+        return pool;
     }
 
     /// Tears the pool down. When a warm flight is still inside connect, waits
