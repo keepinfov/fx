@@ -275,6 +275,7 @@ pub const AutoUpgrade = struct {
         SelfExeNotFound,
         InstallFailed,
         Cancelled,
+        ProxiedHttpsUnsupported,
     };
 
     fn downloadAndInstall(
@@ -300,7 +301,7 @@ pub const AutoUpgrade = struct {
         const archive_url = std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform }) catch return error.AllocFailed;
         defer alloc.free(archive_url);
 
-        var client = proxy_mod.initClient(alloc, .upgrade, archive_url);
+        var client = try proxy_mod.initClient(alloc, .upgrade, archive_url);
         defer client.deinit();
 
         helpers.downloadFileStreaming(&client, archive_url, archive_path, self.transferControl()) catch |err| return switch (err) {

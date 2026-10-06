@@ -46,9 +46,9 @@ pub const HttpPool = struct {
     /// instead of `init` on production paths: std reads the client proxy
     /// fields without a lock while connecting, so the policy must be in place
     /// before `warmAsync` or the first borrow.
-    pub fn initForUrl(alloc: std.mem.Allocator, surface: proxy_mod.Surface, url: []const u8) HttpPool {
+    pub fn initForUrl(alloc: std.mem.Allocator, surface: proxy_mod.Surface, url: []const u8) proxy_mod.TransportError!HttpPool {
         var pool = init(alloc);
-        proxy_mod.applyToClient(&pool.client, surface, url);
+        try proxy_mod.applyToClient(&pool.client, surface, url);
         return pool;
     }
 

@@ -69,6 +69,65 @@ function closedPort(): number {
   return port;
 }
 
+/**
+ * A raw TCP proxy that answers CONNECT with 200 and then records every byte the
+ * client sends inside the tunnel.
+ *
+ * `startForwardProxy` never gets this far because it refuses CONNECT, so it can
+ * only observe plaintext forwarding. Whether the origin request is encrypted is
+ * only visible on the raw tunnel bytes, which is what this probe captures.
+ */
+function startTunnelProbeProxy() {
+  const connects: string[] = [];
+  const chunks: Buffer[] = [];
+  type Probe = { mode: "headers" | "tunnel"; buffer: string };
+  const sockets = new Map<object, Probe>();
+  const server = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(socket) {
+        sockets.set(socket, { mode: "headers", buffer: "" });
+      },
+      data(socket, data) {
+        const probe = sockets.get(socket);
+        if (!probe) return;
+        if (probe.mode === "headers") {
+          probe.buffer += Buffer.from(data).toString("latin1");
+          const end = probe.buffer.indexOf("\r\n\r\n");
+          if (end === -1) return;
+          connects.push(probe.buffer.slice(0, end).split("\r\n")[0] ?? "");
+          const rest = probe.buffer.slice(end + 4);
+          probe.mode = "tunnel";
+          probe.buffer = "";
+          socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          if (rest.length > 0) chunks.push(Buffer.from(rest, "latin1"));
+          // Hang up once the client has had a moment to flush its request, so
+          // the run terminates instead of waiting on a reply this probe never
+          // sends.
+          setTimeout(() => socket.end(), 250);
+          return;
+        }
+        chunks.push(Buffer.from(data));
+      },
+      close(socket) {
+        sockets.delete(socket);
+      },
+      error(socket) {
+        sockets.delete(socket);
+      },
+    },
+  });
+  return {
+    url: `http://127.0.0.1:${server.port}`,
+    connects,
+    bytes: () => Buffer.concat(chunks),
+    stop() {
+      server.stop(true);
+    },
+  };
+}
+
 function isolatedHomeWithFxDir(): string {
   const home = realpathSync(createIsolatedTestHome());
   mkdirSync(join(home, ".fx"), { mode: 0o700 });
@@ -231,4 +290,41 @@ describe("outbound proxy", () => {
       cleanupIsolatedTestHome(home);
     }
   }, 30000);
+
+  test("proxy TLS: never sends the origin request in plaintext through a proxy", async () => {
+    const originPort = closedPort();
+    const marker = "fx-tunnel-marker-9f3c1a";
+    const fixture = createConfiguredProviderFixture(undefined, {
+      baseUrl: `https://127.0.0.1:${originPort}/v1`,
+    });
+    const probe = startTunnelProbeProxy();
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], {
+        cwd: fixture.workspace,
+        env: proxyEnv(fixture.env, {
+          FX_PROVIDER: "remote",
+          FX_TEST_PROVIDER_TOKEN: marker,
+          FX_PROXY: probe.url,
+          FX_PROXY_APPLY_TO: "model",
+          // Route even loopback through the proxy so the tunnel is exercised.
+          FX_NO_PROXY: "",
+        }),
+        timeoutMs: 25000,
+      });
+
+      // The proxy must never see the origin credentials or the request body in
+      // the clear. Two outcomes are acceptable: a real TLS handshake to the
+      // origin inside the tunnel, or a refusal that never opens the connection.
+      // A plaintext request line is exactly the defect this pins.
+      const bytes = probe.bytes();
+      const asText = bytes.toString("latin1");
+      expect(asText).not.toContain(marker);
+      expect(/^(POST|GET|PUT|PATCH|DELETE) /.test(asText)).toBe(false);
+      if (bytes.length > 0) expect(bytes[0]).toBe(0x16);
+      expect(result.code).not.toBe(0);
+    } finally {
+      probe.stop();
+      fixture.close();
+    }
+  }, 45000);
 });
