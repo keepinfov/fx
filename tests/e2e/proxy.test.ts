@@ -161,12 +161,24 @@ describe("outbound proxy", () => {
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(result.stdout).toContain("proxy=http://[redacted]@127.0.0.1:3128");
       expect(result.stdout).toContain("proxy_origin=settings");
-      expect(result.stdout).toContain("proxy_surfaces=model:configured mcp:configured upgrade:off children:off");
+      expect(result.stdout).toContain("proxy_surfaces=model:configured mcp:configured upgrade:off children:off web:off");
       expect(result.stdout).not.toContain("hidden");
+
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ proxy: { url: "http://127.0.0.1:3128", apply_to: ["web"] } }),
+        { mode: 0o600 },
+      );
+      const webOnly = await runFx(["status"], {
+        env: proxyEnv({ HOME: home }, {}),
+        timeoutMs: 20000,
+      });
+      if (webOnly.code !== 0) throw new Error(webOnly.stdout + webOnly.stderr);
+      expect(webOnly.stdout).toContain("proxy_surfaces=model:off mcp:off upgrade:off children:off web:configured");
     } finally {
       cleanupIsolatedTestHome(home);
     }
-  }, 30000);
+  }, 40000);
 
   test("exports the proxy to child processes only for the children surface", async () => {
     const fixture = createConfiguredProviderFixture();

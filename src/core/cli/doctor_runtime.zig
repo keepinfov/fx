@@ -553,9 +553,9 @@ fn appendProxyCheck(checks: *std.ArrayList(Check), alloc: Allocator, profile_loa
     }
 
     if (proxy_mod.explicitOrigin()) |origin| {
-        var buffer: [4]proxy_mod.Surface = undefined;
+        var buffer: [proxy_mod.max_surfaces]proxy_mod.Surface = undefined;
         const surfaces = proxy_mod.explicitSurfaces(&buffer);
-        var names: [4][]const u8 = undefined;
+        var names: [proxy_mod.max_surfaces][]const u8 = undefined;
         for (surfaces, 0..) |surface, index| names[index] = @tagName(surface);
         const joined = try std.mem.join(alloc, ", ", names[0..surfaces.len]);
         defer alloc.free(joined);

@@ -4840,10 +4840,14 @@ test "proxy parses replaces on merge and rejects invalid entries" {
     try std.testing.expectEqualStrings("https://proxy.example:3128", first.proxy.?.url);
     try std.testing.expect(first.proxy.?.no_proxy == null);
 
+    var web_scope = try parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"apply_to\":[\"web\"]}}");
+    defer web_scope.deinit(alloc);
+    try std.testing.expectEqualSlices(proxy_mod.Surface, &.{.web}, web_scope.proxy.?.apply_to.?);
+
     try std.testing.expectError(error.InvalidProxyType, parseSettingsJson(alloc, "{\"proxy\":\"http://127.0.0.1:8080\"}"));
     try std.testing.expectError(error.ProxyUrlRequired, parseSettingsJson(alloc, "{\"proxy\":{\"no_proxy\":[]}}"));
     try std.testing.expectError(error.InvalidProxyUrlValue, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"socks5://127.0.0.1:1080\"}}"));
-    try std.testing.expectError(error.InvalidProxyApplyToValue, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"apply_to\":[\"web\"]}}"));
+    try std.testing.expectError(error.InvalidProxyApplyToValue, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"apply_to\":[\"fetch\"]}}"));
     try std.testing.expectError(error.InvalidProxyNoProxyEntry, parseSettingsJson(alloc, "{\"proxy\":{\"url\":\"http://127.0.0.1:8080\",\"no_proxy\":[7]}}"));
 }
 

@@ -31,11 +31,18 @@ const text_utils = @import("text_utils.zig");
 /// (shell commands, stdio MCP servers, skill installs). It is off unless the
 /// user names it, because a child that reads `HTTP_PROXY` may reach a corporate
 /// proxy that local tooling never has to touch.
-pub const Surface = enum { model, mcp, upgrade, children };
+///
+/// `web` covers `web_fetch`, which resolves and dials its own sockets so a
+/// target cannot slip past the public-address policy. `web_search` runs at the
+/// model provider and stays on `model`.
+pub const Surface = enum { model, mcp, upgrade, children, web };
 
-/// Default scope of an explicit proxy: model traffic only. MCP, upgrade, and
-/// child processes keep using the standard environment fallback.
+/// Default scope of an explicit proxy: model traffic only. MCP, upgrade, child
+/// processes, and web fetches keep using the standard environment fallback.
 pub const default_apply_to = &[_]Surface{.model};
+
+/// Number of surfaces, so callers can size a buffer without hardcoding it.
+pub const max_surfaces = std.meta.fields(Surface).len;
 
 /// Loopback names and addresses are never sent to an explicitly configured
 /// proxy unless the list is replaced. Local model servers (Ollama, LM Studio,
@@ -482,19 +489,55 @@ pub fn applyToClient(client: *std.http.Client, surface: Surface, url: []const u8
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     const target = targetOf(url, &host_buffer) orelse return;
 
+    if (selectProxy(state, surface, false, target.host, target.port)) |proxy| client.http_proxy = proxy;
+    if (selectProxy(state, surface, true, target.host, target.port)) |proxy| client.https_proxy = proxy;
+}
+
+/// One proxy endpoint a transport that dials its own sockets can connect to.
+/// Every field is borrowed from the process resolution.
+pub const Endpoint = struct {
+    host: []const u8,
+    port: u16,
+    /// Whether the endpoint itself speaks TLS, which an `https://` proxy URL
+    /// requests.
+    tls: bool,
+    /// Value for a `Proxy-Authorization` header, credentials included.
+    authorization: ?[]const u8,
+};
+
+/// The proxy one target must be dialed through, or null when the target is
+/// dialed directly. `target_tls` selects the standard variable that supplies
+/// the environment fallback, matching how `std.http.Client` reads `HTTP_PROXY`
+/// and `HTTPS_PROXY`. Read-only: no allocation, no locking, any thread.
+pub fn endpointFor(surface: Surface, target_tls: bool, host: []const u8, port: u16) ?Endpoint {
+    const state = global_state orelse return null;
+    const proxy = selectProxy(state, surface, target_tls, host, port) orelse return null;
+    return .{
+        .host = proxy.host.bytes,
+        .port = proxy.port,
+        .tls = proxy.protocol == .tls,
+        .authorization = proxy.authorization,
+    };
+}
+
+/// Precedence shared by every surface: an explicit proxy in scope wins, and a
+/// bypass entry for the target means a direct connection rather than a fallback
+/// to the standard variables. Only a surface outside the explicit scope reaches
+/// `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY`.
+fn selectProxy(state: *const State, surface: Surface, target_tls: bool, host: []const u8, port: u16) ?*std.http.Client.Proxy {
+    if (surface == .children) return null;
+
     if (state.explicit_proxy) |proxy| {
         if (state.explicit_surfaces.contains(surface)) {
-            if (ruleMatches(state.explicit_rules, target.host, target.port)) return;
-            client.http_proxy = proxy;
-            client.https_proxy = proxy;
-            return;
+            if (ruleMatches(state.explicit_rules, host, port)) return null;
+            return proxy;
         }
     }
 
-    if (state.env_http_proxy == null and state.env_https_proxy == null) return;
-    if (ruleMatches(state.env_rules, target.host, target.port)) return;
-    client.http_proxy = state.env_http_proxy;
-    client.https_proxy = state.env_https_proxy;
+    const environment = if (target_tls) state.env_https_proxy else state.env_http_proxy;
+    const proxy = environment orelse return null;
+    if (ruleMatches(state.env_rules, host, port)) return null;
+    return proxy;
 }
 
 /// The single client factory: a fresh client carrying the policy for
@@ -876,13 +919,67 @@ test "sourceFor reports where each surface resolves" {
     try testing.expect(isEnabled(.mcp));
     try testing.expect(environmentConfigured());
 
-    var buffer: [4]Surface = undefined;
+    var buffer: [5]Surface = undefined;
     try testing.expectEqualSlices(Surface, &.{.model}, explicitSurfaces(&buffer));
 
     reset();
     try testing.expectEqual(Source.none, sourceFor(.model));
     try testing.expect(!environmentConfigured());
     try testing.expectEqualSlices(Surface, &.{}, explicitSurfaces(&buffer));
+}
+
+test "endpointFor follows the explicit scope, the bypass list, and the target scheme" {
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "http://user:secret@127.0.0.1:8080" },
+        .{ "FX_PROXY_APPLY_TO", "model,web" },
+        .{ "HTTP_PROXY", "http://plain-proxy.example:3128" },
+        .{ "HTTPS_PROXY", "http://secure-proxy.example:8443" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    // In scope: the explicit proxy wins, credentials included.
+    const web = endpointFor(.web, true, "example.com", 443).?;
+    try testing.expectEqualStrings("127.0.0.1", web.host);
+    try testing.expectEqual(@as(u16, 8080), web.port);
+    try testing.expect(!web.tls);
+    try testing.expect(web.authorization != null);
+
+    // A bypass entry in scope means a direct connection, never a fallback.
+    try testing.expect(endpointFor(.web, true, "localhost", 443) == null);
+    try testing.expect(endpointFor(.web, false, "127.0.0.1", 80) == null);
+
+    // Out of scope: the standard variables decide, by target scheme.
+    const plain_fallback = endpointFor(.mcp, false, "example.com", 80).?;
+    try testing.expectEqualStrings("plain-proxy.example", plain_fallback.host);
+    try testing.expectEqual(@as(u16, 3128), plain_fallback.port);
+    const tls_fallback = endpointFor(.mcp, true, "example.com", 443).?;
+    try testing.expectEqualStrings("secure-proxy.example", tls_fallback.host);
+    try testing.expectEqual(@as(u16, 8443), tls_fallback.port);
+
+    // Children export variables instead of dialing, so they never select one.
+    try testing.expect(endpointFor(.children, true, "example.com", 443) == null);
+}
+
+test "endpointFor reports a TLS proxy endpoint and nothing without a resolution" {
+    try testing.expect(endpointFor(.web, true, "example.com", 443) == null);
+
+    var map = try testEnv(&.{
+        .{ "FX_PROXY", "https://secure-proxy.example:8443" },
+        .{ "FX_PROXY_APPLY_TO", "web" },
+    });
+    defer map.deinit();
+
+    try initFromEnvMap(&map, .{});
+    defer reset();
+
+    const web = endpointFor(.web, true, "example.com", 443).?;
+    try testing.expectEqualStrings("secure-proxy.example", web.host);
+    try testing.expectEqual(@as(u16, 8443), web.port);
+    try testing.expect(web.tls);
+    try testing.expect(web.authorization == null);
 }
 
 test "childExports covers the children surface only" {

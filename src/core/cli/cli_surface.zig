@@ -4679,9 +4679,20 @@ test "proxy flags parse into modifiers and skip command detection" {
         error.InvalidProxyValue,
         parseGlobalLaunchArgs(alloc, &.{@constCast("--proxy=socks5://127.0.0.1:1080")}),
     );
+    var web_scope = try parseGlobalLaunchArgs(alloc, &.{
+        @constCast("--proxy=http://127.0.0.1:8080"),
+        @constCast("--proxy-apply-to=model,web"),
+    });
+    defer web_scope.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        proxy_mod.Surface,
+        &.{ .model, .web },
+        web_scope.modifiers.proxy_apply_to.?,
+    );
+
     try std.testing.expectError(
         error.InvalidProxyApplyToValue,
-        parseGlobalLaunchArgs(alloc, &.{@constCast("--proxy-apply-to=web")}),
+        parseGlobalLaunchArgs(alloc, &.{@constCast("--proxy-apply-to=fetch")}),
     );
 
     const remaining = argsAfterGlobalLaunchArgs(&.{

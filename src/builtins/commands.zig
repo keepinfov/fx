@@ -380,7 +380,7 @@ pub const top_level_flags = [_]TopLevelFlag{
     },
     .{
         .usage = "--proxy-apply-to <a,b,...>",
-        .description = "Surfaces the proxy covers: model, mcp, upgrade, children; defaults to the configured scope",
+        .description = "Surfaces the proxy covers: model, mcp, upgrade, children, web; defaults to the configured scope",
     },
     .{
         .usage = "-c, --continue",

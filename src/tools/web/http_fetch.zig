@@ -11,9 +11,11 @@ pub const max_body_bytes: usize = 10 * 1024 * 1024;
 const max_redirect_hops: usize = 10;
 const default_hop_timeout_ms: i64 = 60 * 1000;
 const max_header_bytes: usize = 64 * 1024;
+const max_tunnel_head_bytes: usize = 16 * 1024;
 const plain_transport_buffer_len: usize = 4096;
 const tls_transport_buffer_len: usize = std.crypto.tls.Client.min_buffer_len;
 const tls_allow_truncation_attacks = false;
+const user_agent = "fx (web_fetch; +https://github.com/vercel-labs/fx)";
 
 const FailureStage = enum {
     connect,
@@ -56,6 +58,9 @@ pub const Connector = struct {
 pub const Transport = struct {
     resolver: Resolver,
     connector: Connector,
+    /// Consulted once per hop. Null means every target is dialed directly,
+    /// which is the behavior when no proxy policy is installed.
+    proxy: ?ProxySelector = null,
 };
 
 pub fn defaultTransport() Transport {
@@ -65,11 +70,42 @@ pub fn defaultTransport() Transport {
     };
 }
 
+/// The proxy for one target host, as chosen by the process policy. Borrowed
+/// storage: the selector owns every field for as long as the transport lives.
+pub const ProxyEndpoint = struct {
+    host: []const u8,
+    port: u16,
+    /// Whether the proxy endpoint itself speaks TLS. An `https://` proxy is
+    /// rejected for a fetch, because this transport would have to nest its own
+    /// TLS session inside another one.
+    tls: bool,
+    /// Value for a `Proxy-Authorization` header, credentials included.
+    authorization: ?[]const u8 = null,
+};
+
+/// Process policy hook: which proxy covers one target host on the `web`
+/// surface, or null when the target is dialed directly.
+pub const ProxySelector = struct {
+    ctx: *anyopaque,
+    select: *const fn (*anyopaque, host: []const u8, port: u16, target_tls: bool) ?ProxyEndpoint,
+};
+
 pub const PinnedTarget = struct {
     url: url_policy.ValidatedUrl,
     admitted_addresses: []const IpAddress,
     tls_server_name: []const u8,
     host_header: []const u8,
+    /// Set when the request must go through a proxy. `admitted_addresses`
+    /// still holds the target's own addresses, because the public-address
+    /// policy runs before any connection is opened.
+    proxy: ?ProxyDial = null,
+};
+
+pub const ProxyDial = struct {
+    endpoint: ProxyEndpoint,
+    /// Addresses of the proxy itself. The operator chose it, so loopback and
+    /// private addresses are expected instead of rejected.
+    admitted_addresses: []const IpAddress,
 };
 
 pub const ConnectorResponse = struct {
@@ -154,11 +190,21 @@ pub fn fetch(alloc: Allocator, initial: url_policy.ValidatedUrl, options: FetchO
         const host_header = try hostHeader(alloc, current);
         defer alloc.free(host_header);
 
+        var proxy_dial: ?ProxyDial = null;
+        var proxy_addresses: []IpAddress = &.{};
+        defer if (proxy_addresses.len > 0) alloc.free(proxy_addresses);
+
+        if (proxyEndpointFor(current, transport.proxy)) |endpoint| {
+            proxy_addresses = try resolveProxyAddresses(alloc, endpoint, hop_options, transport.resolver);
+            proxy_dial = .{ .endpoint = endpoint, .admitted_addresses = proxy_addresses };
+        }
+
         const pinned: PinnedTarget = .{
             .url = current,
             .admitted_addresses = addresses,
             .tls_server_name = current.canonical_host,
             .host_header = host_header,
+            .proxy = proxy_dial,
         };
 
         var response = try transport.connector.get(transport.connector.ctx, alloc, pinned, hop_options);
@@ -299,6 +345,25 @@ fn resolveAddresses(alloc: Allocator, target: url_policy.ValidatedUrl, options: 
         return out;
     }
     return resolver.resolve(resolver.ctx, alloc, target.canonical_host, target.port, normalizedOptions(options));
+}
+
+/// The proxy that covers this hop, or null when the target is dialed directly.
+fn proxyEndpointFor(target: url_policy.ValidatedUrl, selector: ?ProxySelector) ?ProxyEndpoint {
+    const hook = selector orelse return null;
+    return hook.select(hook.ctx, target.canonical_host, target.port, target.scheme == .https);
+}
+
+/// Resolves the proxy endpoint. Unlike a target, the proxy is operator
+/// configuration, so a loopback or private address is expected and the
+/// public-address policy does not apply to it.
+fn resolveProxyAddresses(alloc: Allocator, endpoint: ProxyEndpoint, options: FetchOptions, resolver: Resolver) ![]IpAddress {
+    if (std.Io.net.IpAddress.parse(endpoint.host, endpoint.port)) |literal| {
+        const out = try alloc.alloc(IpAddress, 1);
+        out[0] = literal;
+        return out;
+    } else |_| {}
+
+    return resolver.resolve(resolver.ctx, alloc, endpoint.host, endpoint.port, normalizedOptions(options));
 }
 
 fn cloneUrl(alloc: Allocator, source: url_policy.ValidatedUrl) !url_policy.ValidatedUrl {
@@ -455,22 +520,38 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
         .ctx = @ptrCast(&default_connector_ctx),
         .connect_fn = connectDefaultDialer,
     };
-    const fd = connectAdmitted(target.admitted_addresses, effective, dialer) catch |err| {
+    const proxy = target.proxy;
+    const dial_addresses = if (proxy) |dial| dial.admitted_addresses else target.admitted_addresses;
+    const fd = connectAdmitted(dial_addresses, effective, dialer) catch |err| {
         traceFailure(.connect, err);
         return err;
     };
     defer closeFd(fd);
 
+    const endpoint = if (proxy) |dial| dial.endpoint else null;
+    if (endpoint) |proxy_endpoint| {
+        // A TLS proxy would need a second TLS session nested inside the first,
+        // which this transport does not attempt. Failing here keeps the
+        // configured proxy authoritative instead of falling back to a direct
+        // connection.
+        if (proxy_endpoint.tls) return error.TlsProxyUnsupported;
+    }
+
     return switch (target.url.scheme) {
-        .http => try fetchPlain(alloc, fd, target, effective),
-        .https => try fetchTls(alloc, fd, target, effective),
+        .http => try fetchPlain(alloc, fd, target, effective, endpoint),
+        .https => if (endpoint) |proxy_endpoint|
+            try fetchTlsThroughProxy(alloc, fd, target, proxy_endpoint, effective)
+        else
+            try fetchTls(alloc, fd, target, effective),
     };
 }
 
-fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+/// Plain HTTP through a proxy needs no tunnel: the proxy applies the request
+/// line to the absolute URL the client sends.
+fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions, proxy: ?ProxyEndpoint) anyerror!ConnectorResponse {
     var writer: PlainDeadlineWriter = undefined;
     writer.init(fd, options);
-    writeRequest(&writer.interface, target, options) catch |err| {
+    writeRequest(&writer.interface, target, options, proxy) catch |err| {
         const root = unwrapWriteFailure(err, writer.err);
         traceFailure(.request_write, root);
         return root;
@@ -489,6 +570,74 @@ fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: F
         traceFailure(failure_stage, root);
         return root;
     };
+}
+
+/// The proxy is asked to open a raw tunnel to the target, and the caller's own
+/// TLS session runs inside it. The target's certificate is therefore still
+/// verified against the target's name, so the proxy cannot read or alter the
+/// request.
+fn fetchTlsThroughProxy(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, endpoint: ProxyEndpoint, options: FetchOptions) anyerror!ConnectorResponse {
+    try openTunnel(alloc, fd, target, endpoint, options);
+    return fetchTls(alloc, fd, target, options);
+}
+
+fn openTunnel(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, endpoint: ProxyEndpoint, options: FetchOptions) anyerror!void {
+    var writer: PlainDeadlineWriter = undefined;
+    writer.init(fd, options);
+    writeTunnelRequest(alloc, &writer.interface, target, endpoint) catch |err| {
+        const root = unwrapWriteFailure(err, writer.err);
+        traceFailure(.connect, root);
+        return root;
+    };
+    writer.interface.flush() catch |err| {
+        const root = unwrapWriteFailure(err, writer.err);
+        traceFailure(.connect, root);
+        return root;
+    };
+
+    // One byte per read: a buffered read could pull tunnel bytes into the
+    // buffer that the TLS session would then never see.
+    var reader: TunnelDeadlineReader = undefined;
+    reader.init(fd, options);
+    const status = readTunnelStatus(alloc, &reader.interface) catch |err| {
+        const root = unwrapReadFailure(err, null, reader.err);
+        traceFailure(.connect, root);
+        return root;
+    };
+    if (status.class() != .success) return error.ProxyTunnelRejected;
+}
+
+fn readTunnelStatus(alloc: Allocator, reader: *std.Io.Reader) anyerror!std.http.Status {
+    var head: std.ArrayList(u8) = .empty;
+    defer head.deinit(alloc);
+
+    while (std.mem.find(u8, head.items, "\r\n\r\n") == null) {
+        if (head.items.len >= max_tunnel_head_bytes) return error.ProxyTunnelHeadOversize;
+        const byte = reader.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedClose,
+            else => return err,
+        };
+        try head.append(alloc, byte);
+    }
+
+    var parsed = try parseHead(alloc, head.items[0 .. head.items.len - "\r\n\r\n".len]);
+    defer parsed.deinit(alloc);
+    return parsed.status;
+}
+
+fn writeTunnelRequest(alloc: Allocator, writer: *std.Io.Writer, target: PinnedTarget, endpoint: ProxyEndpoint) !void {
+    const host = try hostForHeader(alloc, target.url.canonical_host);
+    defer alloc.free(host);
+    try writer.print(
+        "CONNECT {s}:{d} HTTP/1.1\r\n" ++
+            "Host: {s}:{d}\r\n" ++
+            "User-Agent: {s}\r\n",
+        .{ host, target.url.port, host, target.url.port, user_agent },
+    );
+    if (endpoint.authorization) |authorization| {
+        try writer.print("Proxy-Authorization: {s}\r\n", .{authorization});
+    }
+    try writer.writeAll("\r\n");
 }
 
 fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
@@ -542,7 +691,7 @@ fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: Fet
         return root;
     };
 
-    writeRequest(&tls_client.writer, target, options) catch |err| {
+    writeRequest(&tls_client.writer, target, options, null) catch |err| {
         const root = unwrapWriteFailure(err, encrypted_writer.err);
         traceFailure(.request_write, root);
         return root;
@@ -566,18 +715,40 @@ fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: Fet
     };
 }
 
-fn writeRequest(writer: *std.Io.Writer, target: PinnedTarget, options: FetchOptions) !void {
+fn writeRequest(writer: *std.Io.Writer, target: PinnedTarget, options: FetchOptions, proxy: ?ProxyEndpoint) !void {
     try checkControl(options);
+    if (proxy != null) {
+        // A proxy resolves the target itself, so the request line carries the
+        // absolute URL instead of only the path.
+        try writer.print("GET {s}://{s}{s} HTTP/1.1\r\n", .{
+            schemeName(target.url.scheme),
+            target.host_header,
+            target.url.path_query,
+        });
+    } else {
+        try writer.print("GET {s} HTTP/1.1\r\n", .{target.url.path_query});
+    }
     try writer.print(
-        "GET {s} HTTP/1.1\r\n" ++
-            "Host: {s}\r\n" ++
-            "User-Agent: fx (web_fetch; +https://github.com/vercel-labs/fx)\r\n" ++
+        "Host: {s}\r\n" ++
+            "User-Agent: {s}\r\n" ++
             "Accept: text/markdown, text/html, */*\r\n" ++
             "Accept-Encoding: gzip, deflate, zstd\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n",
-        .{ target.url.path_query, target.host_header },
+            "Connection: close\r\n",
+        .{ target.host_header, user_agent },
     );
+    if (proxy) |endpoint| {
+        if (endpoint.authorization) |authorization| {
+            try writer.print("Proxy-Authorization: {s}\r\n", .{authorization});
+        }
+    }
+    try writer.writeAll("\r\n");
+}
+
+fn schemeName(scheme: url_policy.Scheme) []const u8 {
+    return switch (scheme) {
+        .http => "http",
+        .https => "https",
+    };
 }
 
 fn readResponse(
@@ -1384,6 +1555,8 @@ fn unwrapWriteFailure(err: anyerror, transport_err: ?anyerror) anyerror {
 
 const PlainDeadlineReader = DeadlineReader(plain_transport_buffer_len);
 const TlsDeadlineReader = DeadlineReader(tls_transport_buffer_len);
+/// Capacity one, so a read cannot pull bytes past the end of a proxy reply.
+const TunnelDeadlineReader = DeadlineReader(1);
 const PlainDeadlineWriter = DeadlineWriter(plain_transport_buffer_len);
 const TlsDeadlineWriter = DeadlineWriter(tls_transport_buffer_len);
 
@@ -2807,7 +2980,7 @@ test "web_fetch advertises supported content codings" {
         .admitted_addresses = &.{},
         .tls_server_name = "example.com",
         .host_header = "example.com",
-    }, .{});
+    }, .{}, null);
 
     try std.testing.expectEqualStrings(
         "GET /docs?q=1 HTTP/1.1\r\n" ++
@@ -2961,6 +3134,246 @@ fn replaceOwned(alloc: Allocator, slot: *?[]u8, value: []const u8) !void {
 
 fn ip(text: []const u8, port: u16) !IpAddress {
     return std.Io.net.IpAddress.parse(text, port);
+}
+
+/// A one-shot proxy that accepts the fetch transport's connection, records the
+/// request head, and answers according to `mode`.
+const FakeProxy = struct {
+    const Mode = enum {
+        /// Accept the requested tunnel and then close, so the caller's own TLS
+        /// session is what fails next.
+        accept_tunnel,
+        /// Refuse the requested tunnel.
+        reject_tunnel,
+        /// Record the request and close without answering.
+        silent,
+    };
+
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    mode: Mode,
+    thread: ?std.Thread = null,
+    failure: ?anyerror = null,
+    captured_head: [4096]u8 = undefined,
+    captured_len: usize = 0,
+
+    fn init(mode: Mode) !FakeProxy {
+        var self = FakeProxy{ .server = undefined, .mode = mode };
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
+        return self;
+    }
+
+    fn port(self: *const FakeProxy) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn captured(self: *const FakeProxy) []const u8 {
+        return self.captured_head[0..self.captured_len];
+    }
+
+    fn start(self: *FakeProxy) !void {
+        std.debug.assert(self.thread == null);
+        self.thread = try std.Thread.spawn(.{}, serveOne, .{self});
+    }
+
+    fn deinit(self: *FakeProxy) void {
+        const zio = self.io_backend.io();
+        if (self.thread) |thread| thread.join();
+        self.server.deinit(zio);
+        if (self.failure) |err| std.debug.panic("fake proxy failed: {s}", .{@errorName(err)});
+    }
+
+    fn serveOne(self: *FakeProxy) void {
+        self.serveOneFallible() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn serveOneFallible(self: *FakeProxy) !void {
+        const zio = self.io_backend.io();
+        var stream = try self.server.accept(zio);
+        defer stream.close(zio);
+
+        var socket_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(zio, &socket_buffer);
+        var tail: [4]u8 = .{ 0, 0, 0, 0 };
+        while (self.captured_len < self.captured_head.len) {
+            const byte = reader.interface.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            self.captured_head[self.captured_len] = byte;
+            self.captured_len += 1;
+            tail = .{ tail[1], tail[2], tail[3], byte };
+            if (std.mem.eql(u8, &tail, "\r\n\r\n")) break;
+        }
+
+        const reply: []const u8 = switch (self.mode) {
+            .accept_tunnel => "HTTP/1.1 200 Connection Established\r\n\r\n",
+            .reject_tunnel => "HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            .silent => return,
+        };
+        var write_buffer: [4096]u8 = undefined;
+        var writer = stream.writer(zio, &write_buffer);
+        // A peer that already went away is not a fixture failure.
+        writer.interface.writeAll(reply) catch return;
+        writer.interface.flush() catch return;
+    }
+};
+
+/// Selector that points every target at one local proxy.
+const FixedProxySelector = struct {
+    port: u16,
+    tls: bool = false,
+    authorization: ?[]const u8 = null,
+
+    fn selector(self: *@This()) ProxySelector {
+        return .{ .ctx = @ptrCast(self), .select = select };
+    }
+
+    fn select(raw: *anyopaque, host: []const u8, port: u16, target_tls: bool) ?ProxyEndpoint {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        _ = host;
+        _ = port;
+        _ = target_tls;
+        return .{ .host = "127.0.0.1", .port = self.port, .tls = self.tls, .authorization = self.authorization };
+    }
+};
+
+/// A resolver-backed transport that keeps the real connector: the fake resolver
+/// supplies the target's public address, and the real dial reaches the local
+/// proxy.
+fn proxyTransport(resolver: *FakeResolver, selector: ProxySelector) Transport {
+    var transport = defaultTransport();
+    transport.resolver = resolver.resolver();
+    transport.proxy = selector;
+    return transport;
+}
+
+test "web_fetch writes an absolute request line when a proxy carries the target" {
+    const alloc = std.testing.allocator;
+    var url = try url_policy.normalize(alloc, "https://example.com/docs?q=1");
+    defer url.deinit(alloc);
+
+    var request: std.Io.Writer.Allocating = .init(alloc);
+    defer request.deinit();
+    try writeRequest(&request.writer, .{
+        .url = url,
+        .admitted_addresses = &.{},
+        .tls_server_name = "example.com",
+        .host_header = "example.com",
+    }, .{}, .{ .host = "127.0.0.1", .port = 8080, .tls = false, .authorization = "Basic dXNlcjpwYXNz" });
+
+    try std.testing.expectEqualStrings(
+        "GET https://example.com/docs?q=1 HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "User-Agent: fx (web_fetch; +https://github.com/vercel-labs/fx)\r\n" ++
+            "Accept: text/markdown, text/html, */*\r\n" ++
+            "Accept-Encoding: gzip, deflate, zstd\r\n" ++
+            "Connection: close\r\n" ++
+            "Proxy-Authorization: Basic dXNlcjpwYXNz\r\n" ++
+            "\r\n",
+        request.written(),
+    );
+}
+
+test "web_fetch asks the proxy for a tunnel before starting its own TLS" {
+    const alloc = std.testing.allocator;
+
+    var proxy = try FakeProxy.init(.accept_tunnel);
+    defer proxy.deinit();
+    try proxy.start();
+
+    var selector = FixedProxySelector{ .port = proxy.port() };
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+
+    // The tunnel opens, so what fails next is the TLS session with a peer that
+    // carries no certificate.
+    if (fetch(alloc, target, .{ .deadline = .{ .deadline_ms = monotonicMillis() + 5000 } }, proxyTransport(&resolver, selector.selector()))) |result| {
+        var value = result;
+        value.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.ProxyTunnelRejected, error.TlsProxyUnsupported => return error.TestUnexpectedError,
+        else => {},
+    }
+
+    const head = proxy.captured();
+    try std.testing.expect(std.mem.startsWith(u8, head, "CONNECT public.example:443 HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.find(u8, head, "Host: public.example:443\r\n") != null);
+    // The origin-form request never reaches the proxy: the tunnel decides.
+    try std.testing.expect(std.mem.find(u8, head, "GET ") == null);
+}
+
+test "web_fetch reports a refused proxy tunnel without dialing the target" {
+    const alloc = std.testing.allocator;
+
+    var proxy = try FakeProxy.init(.reject_tunnel);
+    defer proxy.deinit();
+    try proxy.start();
+
+    var selector = FixedProxySelector{ .port = proxy.port() };
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+
+    try std.testing.expectError(
+        error.ProxyTunnelRejected,
+        fetch(alloc, target, .{ .deadline = .{ .deadline_ms = monotonicMillis() + 5000 } }, proxyTransport(&resolver, selector.selector())),
+    );
+
+    const head = proxy.captured();
+    try std.testing.expect(std.mem.startsWith(u8, head, "CONNECT public.example:443 HTTP/1.1\r\n"));
+    // One resolution only: the target's own addresses were never dialed.
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+}
+
+test "web_fetch refuses an https proxy endpoint instead of dialing directly" {
+    const alloc = std.testing.allocator;
+
+    var proxy = try FakeProxy.init(.silent);
+    defer proxy.deinit();
+    try proxy.start();
+
+    var selector = FixedProxySelector{ .port = proxy.port(), .tls = true };
+    var resolver = FakeResolver{ .addresses = &.{try ip("93.184.216.34", 443)} };
+    defer resolver.deinit(alloc);
+
+    var target = try url_policy.normalize(alloc, "https://public.example/docs");
+    defer target.deinit(alloc);
+
+    try std.testing.expectError(
+        error.TlsProxyUnsupported,
+        fetch(alloc, target, .{ .deadline = .{ .deadline_ms = monotonicMillis() + 5000 } }, proxyTransport(&resolver, selector.selector())),
+    );
+}
+
+test "web_fetch reads a tunnel reply without swallowing tunnel bytes" {
+    const alloc = std.testing.allocator;
+
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeFd(fds[1]);
+    defer closeFd(fds[0]);
+
+    const payload = "HTTP/1.1 200 Connection Established\r\n\r\nTUNNEL";
+    const written = std.c.write(fds[1], payload.ptr, payload.len);
+    if (written < 0 or @as(usize, @intCast(written)) != payload.len) return error.PipeWriteFailed;
+
+    var reader: TunnelDeadlineReader = undefined;
+    reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
+    try std.testing.expectEqual(std.http.Status.ok, try readTunnelStatus(alloc, &reader.interface));
+
+    // The first byte the proxy sent after its reply is still readable, which is
+    // what lets the TLS session pick up the tunnel.
+    try std.testing.expectEqual(@as(u8, 'T'), try reader.interface.takeByte());
 }
 
 test "web_fetch rejects mixed public private dns answers without dialing" {

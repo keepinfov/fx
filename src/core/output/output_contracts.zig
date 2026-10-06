@@ -642,6 +642,7 @@ pub const ProxySnapshot = struct {
     mcp: []const u8 = "off",
     upgrade: []const u8 = "off",
     children: []const u8 = "off",
+    web: []const u8 = "off",
 
     /// Reads the installed policy. No allocation.
     pub fn fromPolicy() ProxySnapshot {
@@ -653,6 +654,7 @@ pub const ProxySnapshot = struct {
             .mcp = proxy_mod.sourceLabel(proxy_mod.sourceFor(.mcp)),
             .upgrade = proxy_mod.sourceLabel(proxy_mod.sourceFor(.upgrade)),
             .children = proxy_mod.sourceLabel(proxy_mod.sourceFor(.children)),
+            .web = proxy_mod.sourceLabel(proxy_mod.sourceFor(.web)),
         };
     }
 
@@ -666,11 +668,12 @@ pub const ProxySnapshot = struct {
     pub fn surfacesLine(self: ProxySnapshot, alloc: Allocator) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.print("model:{s} mcp:{s} upgrade:{s} children:{s}", .{
+        try out.writer.print("model:{s} mcp:{s} upgrade:{s} children:{s} web:{s}", .{
             self.model,
             self.mcp,
             self.upgrade,
             self.children,
+            self.web,
         });
         return try out.toOwnedSlice();
     }
@@ -946,8 +949,8 @@ pub const StatusSnapshot = struct {
                 try writer.writeAll("null");
             }
             try writer.print(
-                ",\"surfaces\":{{\"model\":\"{s}\",\"mcp\":\"{s}\",\"upgrade\":\"{s}\",\"children\":\"{s}\"}}}}",
-                .{ proxy.model, proxy.mcp, proxy.upgrade, proxy.children },
+                ",\"surfaces\":{{\"model\":\"{s}\",\"mcp\":\"{s}\",\"upgrade\":\"{s}\",\"children\":\"{s}\",\"web\":\"{s}\"}}}}",
+                .{ proxy.model, proxy.mcp, proxy.upgrade, proxy.children, proxy.web },
             );
         }
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
@@ -2277,6 +2280,7 @@ test "status snapshot renders the proxy policy per surface" {
             .mcp = "configured",
             .upgrade = "environment",
             .children = "environment",
+            .web = "environment",
         },
     };
 
@@ -2285,7 +2289,7 @@ test "status snapshot renders the proxy policy per surface" {
     try std.testing.expect(std.mem.find(
         u8,
         text,
-        "[status] proxy=http://[redacted]@127.0.0.1:8080\n[status] proxy_origin=settings\n[status] proxy_surfaces=model:configured mcp:configured upgrade:environment children:environment\n",
+        "[status] proxy=http://[redacted]@127.0.0.1:8080\n[status] proxy_origin=settings\n[status] proxy_surfaces=model:configured mcp:configured upgrade:environment children:environment web:environment\n",
     ) != null);
 
     const json = try snapshot.renderJson(std.testing.allocator);
@@ -2293,7 +2297,7 @@ test "status snapshot renders the proxy policy per surface" {
     try std.testing.expect(std.mem.find(
         u8,
         json,
-        "\"proxy\":{\"value\":\"http://[redacted]@127.0.0.1:8080\",\"url\":\"http://[redacted]@127.0.0.1:8080\",\"origin\":\"settings\",\"surfaces\":{\"model\":\"configured\",\"mcp\":\"configured\",\"upgrade\":\"environment\",\"children\":\"environment\"}}",
+        "\"proxy\":{\"value\":\"http://[redacted]@127.0.0.1:8080\",\"url\":\"http://[redacted]@127.0.0.1:8080\",\"origin\":\"settings\",\"surfaces\":{\"model\":\"configured\",\"mcp\":\"configured\",\"upgrade\":\"environment\",\"children\":\"environment\",\"web\":\"environment\"}}",
     ) != null);
 }
 
@@ -2313,7 +2317,7 @@ test "status snapshot reports proxy absence without an explicit url" {
     try std.testing.expect(std.mem.find(
         u8,
         text,
-        "[status] proxy=off\n[status] proxy_surfaces=model:off mcp:off upgrade:off children:off\n",
+        "[status] proxy=off\n[status] proxy_surfaces=model:off mcp:off upgrade:off children:off web:off\n",
     ) != null);
     try std.testing.expect(std.mem.find(u8, text, "proxy_origin") == null);
 
