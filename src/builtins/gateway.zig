@@ -851,7 +851,7 @@ const OAuthHttpOperation = struct {
     request: oauth_transport.Request,
 
     pub fn run(self: *@This()) !oauth_transport.Response {
-        var client = proxy_mod.initClient(self.alloc, .model, self.request.url);
+        var client = try proxy_mod.initClient(self.alloc, .model, self.request.url);
         defer client.deinit();
 
         const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);

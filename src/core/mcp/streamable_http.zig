@@ -344,7 +344,7 @@ fn postCore(alloc: Allocator, options: PostOptions) !PostResponse {
     defer prepared.deinit(alloc);
 
     const uri = std.Uri.parse(options.url) catch return error.InvalidEndpoint;
-    var client = proxy_mod.initClient(alloc, .mcp, options.url);
+    var client = try proxy_mod.initClient(alloc, .mcp, options.url);
     defer client.deinit();
 
     var request = try client.request(.POST, uri, .{

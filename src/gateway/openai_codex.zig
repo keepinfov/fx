@@ -260,7 +260,7 @@ pub fn streamPrepared(
         extra_count += 1;
     };
 
-    var client = proxy_mod.initClient(alloc, .model, request_endpoint);
+    var client = try proxy_mod.initClient(alloc, .model, request_endpoint);
     defer client.deinit();
     var open_operation = gateway_client.PostOperation{
         .client = &client,

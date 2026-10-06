@@ -1177,7 +1177,7 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
     const endpoint = e2e_endpoint orelse teams_endpoint;
 
-    var client = proxy_mod.initClient(alloc, .model, endpoint);
+    var client = try proxy_mod.initClient(alloc, .model, endpoint);
     defer client.deinit();
 
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});

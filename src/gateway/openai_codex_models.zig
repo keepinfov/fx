@@ -176,7 +176,7 @@ const FetchOperation = struct {
     account_id: ?[]const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
-        var client = proxy_mod.initClient(self.alloc, .model, self.url);
+        var client = try proxy_mod.initClient(self.alloc, .model, self.url);
         defer client.deinit();
         var auth_header: ?[]u8 = null;
         defer if (auth_header) |value| secret.zeroAndFree(self.alloc, value);

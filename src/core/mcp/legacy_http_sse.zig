@@ -464,7 +464,7 @@ pub const Client = struct {
 
         const uri = std.Uri.parse(self.discovery_url) catch
             return error.InvalidEndpoint;
-        var http_client = proxy_mod.initClient(self.shared_allocator, .mcp, self.discovery_url);
+        var http_client = try proxy_mod.initClient(self.shared_allocator, .mcp, self.discovery_url);
         defer http_client.deinit();
         var http_request = try http_client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
@@ -743,7 +743,7 @@ fn postMessageCore(
     }
 
     const uri = std.Uri.parse(client.endpoint.?) catch return error.InvalidEndpoint;
-    var http_client = proxy_mod.initClient(alloc, .mcp, client.endpoint.?);
+    var http_client = try proxy_mod.initClient(alloc, .mcp, client.endpoint.?);
     defer http_client.deinit();
     var request = try http_client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
